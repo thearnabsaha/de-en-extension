@@ -1,16 +1,26 @@
 {
   "manifest_version": 3,
-  "name": "DE → EN Page Translator",
-  "version": "1.7.0",
+  "name": "DE \u2192 EN Page Translator",
+  "version": "1.7.1",
   "description": "Toggle-translate German pages to English in place. E2E scenario hardening, huge-page caps, five priority fixes verified.",
-  "permissions": ["activeTab", "scripting", "storage", "webNavigation"],
-  "host_permissions": ["https://translate.googleapis.com/*"],
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "webNavigation"
+  ],
+  "host_permissions": [
+    "https://translate.googleapis.com/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["http://*/*", "https://*/*"],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ],
       "js": [
         "shared/protocol.js",
         "shared/markers.js",
@@ -24,8 +34,13 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["content.css"],
-      "matches": ["http://*/*", "https://*/*"]
+      "resources": [
+        "content.css"
+      ],
+      "matches": [
+        "http://*/*",
+        "https://*/*"
+      ]
     }
   ],
   "commands": {
@@ -33,11 +48,11 @@
       "suggested_key": {
         "default": "Alt+Shift+B"
       },
-      "description": "Toggle DE→EN translation on the current tab"
+      "description": "Toggle DE\u2192EN translation on the current tab"
     }
   },
   "action": {
-    "default_title": "Translate page: German → English (Alt+Shift+B)",
+    "default_title": "Translate page: German \u2192 English (Alt+Shift+B)",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",

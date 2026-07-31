@@ -7,11 +7,22 @@
     try { window.__deEnCleanup(); } catch { /* ignore */ }
   }
 
+  /** Skip text-node collection / subtree walk for these (values stay untranslated). */
   const SKIP_TAGS = new Set([
     "SCRIPT", "STYLE", "NOSCRIPT", "SVG", "CODE", "PRE",
     "TEXTAREA", "INPUT", "IFRAME", "CANVAS", "SELECT", "OPTION",
     "KBD", "SAMP", "MATH", "TEMPLATE", "OBJECT", "EMBED",
   ]);
+  /**
+   * Fully skip attribute collection (not form controls — those need placeholder).
+   * INPUT/TEXTAREA/SELECT are intentionally NOT here.
+   */
+  const SKIP_ATTR_TAGS = new Set([
+    "SCRIPT", "STYLE", "NOSCRIPT", "SVG", "CODE", "PRE",
+    "IFRAME", "CANVAS", "OPTION",
+    "KBD", "SAMP", "MATH", "TEMPLATE", "OBJECT", "EMBED",
+  ]);
+  const FORM_CONTROL_TAGS = new Set(["INPUT", "TEXTAREA", "SELECT"]);
   const ATTRS_TO_TRANSLATE = [
     "title", "alt", "aria-label", "placeholder", "aria-description",
   ];
@@ -177,6 +188,60 @@
     if (el.isContentEditable) return true;
     if (el.closest && el.closest("[data-no-translate], .notranslate, #__de_en_host")) return true;
     return false;
+  }
+
+  /** Allow form controls so placeholder / aria-label / title can be translated. */
+  function shouldSkipAttrElement(el) {
+    if (!el || !(el instanceof Element)) return true;
+    if (SKIP_ATTR_TAGS.has(el.tagName)) return true;
+    if (el.id === "__de_en_host") return true;
+    if (el.closest && el.closest("[data-no-translate], .notranslate, #__de_en_host")) {
+      return true;
+    }
+    // Skip password fields' placeholders only if empty — still translate placeholder text
+    // (never touch .value)
+    return false;
+  }
+
+  /**
+   * Read attribute/property to translate. Prefer attribute; fall back to
+   * IDL properties like .placeholder set only via JS.
+   */
+  function getTranslatableAttrValue(el, attr) {
+    const fromAttr = el.getAttribute(attr);
+    if (fromAttr != null && String(fromAttr).trim()) return String(fromAttr);
+
+    if (attr === "placeholder" && typeof el.placeholder === "string" && el.placeholder.trim()) {
+      return el.placeholder;
+    }
+    if (attr === "title" && typeof el.title === "string" && el.title.trim() && !fromAttr) {
+      // only if no empty attribute — avoid stealing browser default titles
+      return null;
+    }
+    if (attr === "aria-label") {
+      const al = el.getAttribute("aria-label");
+      if (al != null && al.trim()) return al;
+    }
+    return null;
+  }
+
+  function setTranslatableAttr(el, attr, value) {
+    el.setAttribute(attr, value);
+    // Keep IDL in sync so the browser actually shows translated placeholder
+    if (attr === "placeholder" && "placeholder" in el) {
+      try {
+        el.placeholder = value;
+      } catch {
+        /* ignore */
+      }
+    }
+    if (attr === "title" && "title" in el) {
+      try {
+        el.title = value;
+      } catch {
+        /* ignore */
+      }
+    }
   }
 
   function countMatches(re, text) {
@@ -536,19 +601,27 @@
         const el = node;
         if (!seenEl.has(el)) {
           seenEl.add(el);
-          if (!shouldSkipElement(el) && (isVisible(el) || el.tagName === "IMG")) {
+          // Form controls (INPUT/TEXTAREA) are skipped for text, but still need
+          // placeholder / aria-label / title translation.
+          const allowAttrs = !shouldSkipAttrElement(el);
+          const visibleEnough =
+            isVisible(el) || el.tagName === "IMG" || FORM_CONTROL_TAGS.has(el.tagName);
+          if (allowAttrs && visibleEnough) {
             const existing = originalAttrsByEl.get(el) || {};
             const pending = {};
             for (const attr of ATTRS_TO_TRANSLATE) {
               if (existing[attr] != null) continue;
-              const val = el.getAttribute(attr);
+              const val = getTranslatableAttrValue(el, attr);
               if (!val || !val.trim()) continue;
-              if (!shouldTranslateText(val)) continue;
+              // Placeholders are often short German words ("Suchen") — still translate
+              if (attr !== "placeholder" && !shouldTranslateText(val)) continue;
+              if (attr === "placeholder" && looksLikeUrlOrCode(val)) continue;
               pending[attr] = val;
             }
             if (Object.keys(pending).length) attrTargets.push({ el, attrs: pending });
           }
         }
+        // Still skip walking text inside inputs/scripts/etc.
         if (shouldSkipElement(el)) continue;
         if (el.shadowRoot) stack.push(el.shadowRoot);
         const children = el.childNodes;
@@ -837,7 +910,7 @@
         let bag = originalAttrsByEl.get(el);
         if (!bag) { bag = {}; originalAttrsByEl.set(el, bag); }
         if (bag[item.attr] == null) bag[item.attr] = source;
-        el.setAttribute(item.attr, t);
+        setTranslatableAttr(el, item.attr, t);
         return true;
       }
       return false;
@@ -885,7 +958,7 @@
     }
     if (isGenCurrent(gen) && el.isConnected) {
       outputHashes.add(hashStr(out));
-      withOwnMutation(() => { el.setAttribute(item.attr, out); });
+      withOwnMutation(() => { setTranslatableAttr(el, item.attr, out); });
     }
   }
 
@@ -1163,7 +1236,7 @@
       originalTextByNode.clear();
       for (const [el, bag] of originalAttrsByEl.entries()) {
         if (!el.isConnected) continue;
-        for (const [attr, val] of Object.entries(bag)) el.setAttribute(attr, val);
+        for (const [attr, val] of Object.entries(bag)) setTranslatableAttr(el, attr, val);
       }
       originalAttrsByEl.clear();
     });
