@@ -73,24 +73,26 @@
       return Object.assign({ v: 1, type: type }, payload || {});
     };
 
-  const MAX_PACK_CHARS = 1800;
+  /** Larger packs = fewer HTTP requests = much faster */
+  const MAX_PACK_CHARS = 3200;
   let packSeq = 0;
-  const MAX_ENCODED_HINT = 3400;
-  const CONCURRENCY = 3;
-  const MIN_RETRANSLATE_GAP_MS = 1600;
-  const OBSERVER_DEBOUNCE_MS = 700;
-  /** G1: yield to main thread every N nodes while walking */
-  const WALK_YIELD_EVERY = 350;
+  const MAX_ENCODED_HINT = 4600;
+  /** Match SW pool — fire many translates at once */
+  const CONCURRENCY = 24;
+  const MIN_RETRANSLATE_GAP_MS = 800;
+  const OBSERVER_DEBOUNCE_MS = 400;
+  /** Yield less often so collection finishes faster */
+  const WALK_YIELD_EVERY = 2000;
   /** G4: hard cap tracked nodes to limit memory */
-  const MAX_TRACKED_NODES = 8000;
-  const MAX_HASH_SET = 12000;
+  const MAX_TRACKED_NODES = 12000;
+  const MAX_HASH_SET = 16000;
   /**
-   * P: cap network chunks per run on huge pages (news sites) to reduce 429 storms.
-   * Remaining nodes can be translated via another toggle or SPA observer passes.
+   * Higher caps — still bounded, but allow big pages in one pass.
    */
-  const MAX_CHUNKS_PER_RUN = 120;
-  /** P: cap work items collected before chunking */
-  const MAX_ITEMS_PER_RUN = 4000;
+  const MAX_CHUNKS_PER_RUN = 200;
+  const MAX_ITEMS_PER_RUN = 6000;
+  /** How many packed strings per SW batch message (IPC efficiency) */
+  const SW_BATCH_WAVE = 40;
 
   const DEFAULT_HIDDEN_HOSTS = [
     "chrome.google.com",
@@ -898,32 +900,37 @@
   function translateBatchViaBackground(texts) {
     return new Promise(async (resolve, reject) => {
       try {
-        // Prefer per-item local when available (K3)
+        // Local translator: parallel map for speed
         const tr = await getChromeTranslator();
         if (tr && typeof tr.translate === "function") {
-          const results = [];
-          for (const t of texts) {
-            try {
-              const out = await tr.translate(t);
-              results.push({ ok: true, translated: out });
-            } catch (err) {
-              results.push({ ok: false, error: String(err && err.message ? err.message : err) });
-            }
-          }
-          // If all failed, fall through to network batch
+          const results = await Promise.all(
+            texts.map(async (t) => {
+              try {
+                return { ok: true, translated: await tr.translate(t) };
+              } catch (err) {
+                return {
+                  ok: false,
+                  error: String(err && err.message ? err.message : err),
+                };
+              }
+            })
+          );
           if (results.some((r) => r.ok)) {
             resolve(results);
             return;
           }
         }
-        chrome.runtime.sendMessage(makeMsg(Msg.TRANSLATE_BATCH || "DE_EN_TRANSLATE_BATCH", { texts }), (res) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-            return;
+        chrome.runtime.sendMessage(
+          makeMsg(Msg.TRANSLATE_BATCH || "DE_EN_TRANSLATE_BATCH", { texts }),
+          (res) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            if (!res || !res.ok) reject(new Error((res && res.error) || "Batch failed"));
+            else resolve(res.results || []);
           }
-          if (!res || !res.ok) reject(new Error((res && res.error) || "Batch failed"));
-          else resolve(res.results || []);
-        });
+        );
       } catch (e) {
         reject(e);
       }
@@ -1245,7 +1252,6 @@
       }
 
       let chunks = chunkItems(items);
-      // P: huge-page chunk cap (rate-limit safety)
       let chunksCapped = false;
       if (chunks.length > MAX_CHUNKS_PER_RUN) {
         chunks = chunks.slice(0, MAX_CHUNKS_PER_RUN);
@@ -1253,16 +1259,109 @@
       }
       const total = chunks.length;
       let done = 0;
+      let failed = 0;
       setProgress(0, total);
 
-      const pool = await mapPool(chunks, CONCURRENCY, async (chunk) => {
-        await translateChunkItems(chunk, gen);
-        done++;
-        if (isGenCurrent(gen)) {
-          setProgress(done, total);
-          if (!quiet) showBadge(`Translating ${done}/${total}…`, 4000);
+      // Fast path: pack all chunks, send in large parallel waves via SW batch API
+      // (far fewer message round-trips than one IPC per chunk).
+      const prepared = chunks.map((chunk) => {
+        if (chunk.length === 1 && (chunk[0]._isLargeText || chunk[0]._isLargeAttr)) {
+          return { kind: "large", chunk };
         }
-      }, gen);
+        const packed = packChunk(chunk);
+        return {
+          kind: "packed",
+          chunk,
+          packed,
+          packId: chunk._packId,
+        };
+      });
+
+      const largeJobs = prepared.filter((p) => p.kind === "large");
+      const packedJobs = prepared.filter((p) => p.kind === "packed");
+
+      // Run large-node jobs with pool; packed jobs in SW_BATCH_WAVE parallel batches
+      const largePool = mapPool(
+        largeJobs,
+        Math.min(CONCURRENCY, 8),
+        async (job) => {
+          await translateChunkItems(job.chunk, gen);
+          done++;
+          if (isGenCurrent(gen)) {
+            setProgress(done, total);
+            if (!quiet) showBadge(`Translating ${done}/${total}…`, 2500);
+          }
+        },
+        gen
+      );
+
+      async function runPackedWaves() {
+        for (let i = 0; i < packedJobs.length; i += SW_BATCH_WAVE) {
+          if (!isGenCurrent(gen)) return;
+          const wave = packedJobs.slice(i, i + SW_BATCH_WAVE);
+          const texts = wave.map((w) => w.packed);
+          let results;
+          try {
+            results = await translateBatchViaBackground(texts);
+          } catch {
+            // Fallback: per-chunk high concurrency
+            await mapPool(
+              wave,
+              CONCURRENCY,
+              async (job) => {
+                try {
+                  await translateChunkItems(job.chunk, gen);
+                } catch {
+                  failed++;
+                }
+                done++;
+                if (isGenCurrent(gen)) {
+                  setProgress(done, total);
+                  if (!quiet) showBadge(`Translating ${done}/${total}…`, 2500);
+                }
+              },
+              gen
+            );
+            continue;
+          }
+          if (!isGenCurrent(gen)) return;
+          for (let j = 0; j < wave.length; j++) {
+            const job = wave[j];
+            const r = results[j];
+            try {
+              if (!r || !r.ok) {
+                // single retry path
+                await translateChunkItems(job.chunk, gen);
+              } else if (job.chunk.length === 1) {
+                applyItemTranslation(job.chunk[0], r.translated, gen);
+              } else {
+                const parts = unpackChunk(r.translated, job.chunk.length, job.packId);
+                job.chunk.forEach((item, idx) =>
+                  applyItemTranslation(item, parts[idx], gen)
+                );
+              }
+            } catch {
+              try {
+                // L fallback: individual
+                for (const item of job.chunk) {
+                  if (!isGenCurrent(gen)) break;
+                  const solo = await translateViaBackground(sanitizeForPack(item.value));
+                  applyItemTranslation(item, solo, gen);
+                }
+              } catch {
+                failed++;
+              }
+            }
+            done++;
+            if (isGenCurrent(gen)) {
+              setProgress(done, total);
+              if (!quiet) showBadge(`Translating ${done}/${total}…`, 2500);
+            }
+          }
+        }
+      }
+
+      await Promise.all([largePool, runPackedWaves()]);
 
       if (!isGenCurrent(gen)) return;
       pruneDisconnected();
@@ -1270,8 +1369,6 @@
       setUiEnglish(translated);
       if (translated) startObserver();
       lastRetranslateAt = Date.now();
-
-      const failed = pool.failed;
       if (failed > 0 && failed < total) {
         lastErrorDetail = `Partial: ${total - failed}/${total} ok`;
         showBadge(lastErrorDetail);

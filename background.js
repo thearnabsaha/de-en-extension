@@ -17,19 +17,20 @@ const softRedactPII =
 const TRANSLATE_ENDPOINT =
   "https://translate.googleapis.com/translate_a/single?client=gtx&sl=de&tl=en&dt=t&q=";
 
-const MAX_ENCODED_Q = 3500;
+const MAX_ENCODED_Q = 4800;
 /** Reject absurd payloads (F3). */
-const MAX_PLAIN_CHARS = 12000;
-const MAX_BATCH_ITEMS = 40;
-const MAX_RETRIES = 3;
-const BASE_BACKOFF_MS = 450;
+const MAX_PLAIN_CHARS = 20000;
+const MAX_BATCH_ITEMS = 120;
+const MAX_RETRIES = 2;
+const BASE_BACKOFF_MS = 200;
 
-const MAX_CONCURRENT_FETCHES = 2;
-const MIN_GAP_MS = 120;
-/** K2: hard timeout per network attempt */
-const FETCH_TIMEOUT_MS = 12000;
+/** High parallelism for near-instant page translation. */
+const MAX_CONCURRENT_FETCHES = 24;
+const MIN_GAP_MS = 0;
+/** Fail fast so other requests keep moving */
+const FETCH_TIMEOUT_MS = 8000;
 
-const CACHE_MAX = 800;
+const CACHE_MAX = 4000;
 const translateCache = new Map();
 
 let activeFetches = 0;
@@ -174,8 +175,12 @@ function validateText(text) {
 }
 
 async function translateText(text) {
-  // O: soft-redact emails/phones before network
-  const s = validateText(softRedactPII(text));
+  // Fast-path redaction only when needed
+  let raw = text;
+  if (typeof raw === "string" && (raw.includes("@") || /\d{6,}/.test(raw))) {
+    raw = softRedactPII(raw);
+  }
+  const s = validateText(raw);
   if (!s.trim()) return s;
 
   const cached = cacheGet(s);
@@ -219,23 +224,24 @@ async function translateText(text) {
   return translated;
 }
 
+/** Parallel batch — all texts race under the shared concurrency pool. */
 async function translateBatch(texts) {
   if (!Array.isArray(texts)) throw new Error("Batch must be an array");
   if (texts.length > MAX_BATCH_ITEMS) {
     throw new Error("Batch too large (max " + MAX_BATCH_ITEMS + ")");
   }
-  const out = [];
-  for (const t of texts) {
-    try {
-      out.push({ ok: true, translated: await translateText(t) });
-    } catch (err) {
-      out.push({
-        ok: false,
-        error: String(err && err.message ? err.message : err),
-      });
-    }
-  }
-  return out;
+  return Promise.all(
+    texts.map(async (t) => {
+      try {
+        return { ok: true, translated: await translateText(t) };
+      } catch (err) {
+        return {
+          ok: false,
+          error: String(err && err.message ? err.message : err),
+        };
+      }
+    })
+  );
 }
 
 async function pingContent(tabId) {
