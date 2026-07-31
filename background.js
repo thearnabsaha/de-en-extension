@@ -240,12 +240,15 @@ async function ensureContentScript(tabId) {
   return false;
 }
 
-function setActionBadge(tabId, { translated, auto, error, sensitive }) {
+function setActionBadge(tabId, { translated, auto, error, sensitive, errorDetail }) {
   try {
     if (error) {
       chrome.action.setBadgeText({ tabId, text: "!" });
       chrome.action.setBadgeBackgroundColor({ tabId, color: "#d93025" });
-      chrome.action.setTitle({ tabId, title: "DE → EN: translation error" });
+      chrome.action.setTitle({
+        tabId,
+        title: "DE → EN: " + (errorDetail || "translation error"),
+      });
       return;
     }
     if (translated) {
@@ -270,11 +273,30 @@ function setActionBadge(tabId, { translated, auto, error, sensitive }) {
       chrome.action.setBadgeText({ tabId, text: "" });
       chrome.action.setTitle({
         tabId,
-        title: "Translate page: German → English",
+        title: "Translate page: German → English (Alt+Shift+T)",
       });
     }
   } catch {
     /* tab gone */
+  }
+}
+
+/** I6: surface toolbar failures instead of silent no-op */
+async function reportToolbarFailure(tabId, reason) {
+  try {
+    chrome.action.setBadgeText({ tabId, text: "×" });
+    chrome.action.setBadgeBackgroundColor({ tabId, color: "#5f6368" });
+    chrome.action.setTitle({ tabId, title: "DE → EN: " + reason });
+  } catch {
+    /* ignore */
+  }
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "DE_EN_TOOLBAR_FAIL",
+      reason,
+    });
+  } catch {
+    /* no content script — badge title is enough */
   }
 }
 
@@ -298,12 +320,48 @@ async function broadcastToggle(tabId) {
   );
 }
 
-chrome.action.onClicked.addListener(async (tab) => {
+async function toggleActiveTab(tab) {
   if (!tab || !tab.id) return;
+
+  const url = tab.url || "";
+  if (
+    url.startsWith("chrome://") ||
+    url.startsWith("chrome-extension://") ||
+    url.startsWith("edge://") ||
+    url.startsWith("about:") ||
+    url.startsWith("https://chrome.google.com/webstore") ||
+    url.startsWith("https://chromewebstore.google.com")
+  ) {
+    await reportToolbarFailure(
+      tab.id,
+      "Cannot run on this page (browser-restricted URL)"
+    );
+    return;
+  }
+
   const ok = await ensureContentScript(tab.id);
-  if (!ok) return;
+  if (!ok) {
+    await reportToolbarFailure(
+      tab.id,
+      "Could not inject into this tab — try refreshing the page"
+    );
+    return;
+  }
   await broadcastToggle(tab.id);
+}
+
+chrome.action.onClicked.addListener((tab) => {
+  toggleActiveTab(tab);
 });
+
+// Manifest command Alt+Shift+T
+if (chrome.commands && chrome.commands.onCommand) {
+  chrome.commands.onCommand.addListener(async (command) => {
+    if (command !== "toggle-translate") return;
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    await toggleActiveTab(tab);
+  });
+}
 
 /** Only accept messages from our own extension content scripts (F3). */
 function isTrustedSender(sender) {
@@ -377,6 +435,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         auto: !!msg.auto,
         error: !!msg.error,
         sensitive: !!msg.sensitive,
+        errorDetail: msg.errorDetail || "",
       });
     }
     sendResponse({ ok: true });

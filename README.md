@@ -2,7 +2,7 @@
 
 Toggle-translate any webpage from **German to English**, in place. Free — no API key (Google public translate endpoint via the extension service worker).
 
-**v1.3** — SPA observer hardening, per-site prefs, multi-tab storage sync, privacy consent, sensitive-site auto block, closed-shadow panel, message validation.
+**v1.4** — performance (yielding DOM walks, capped maps), language confidence + per-site override, draggable/themed panel, progress bar, toolbar failure feedback, Alt+Shift+T.
 
 ## Install (unpacked)
 
@@ -16,60 +16,47 @@ Toggle-translate any webpage from **German to English**, in place. Free — no A
 | Control | Action |
 |--------|--------|
 | **DE/EN switch** | Translate ↔ restore. Mid-run click **cancels and restores**. |
-| **Auto (global)** | Translate German-looking pages automatically. |
+| **Alt+Shift+T** | Toggle translation (also works from toolbar). |
+| **Auto (global)** | Translate high-confidence German pages automatically. |
 | **Auto on this site** | Cycle: inherit → on → off (red = force off). |
-| **Hide / Show on this site** | Hide panel; small **DE/EN** chip re-shows it. |
+| **Page language** | Auto / Force DE / Force EN (per site). |
+| **Theme** | Auto / Dark / Light. |
+| **Drag handle (⠿)** | Reposition panel (saved per site). |
+| **Hide / Show** | Hide panel; **DE/EN** chip re-shows it. |
 | **Privacy notice** | Required once before any network translate. |
-| **Toolbar icon** | Toggle all frames; badge `EN` / `A` / `P` (privacy-sensitive) / `!`. |
+| **Toolbar badge** | `EN` translated · `A` auto · `P` sensitive · `!` error · `×` cannot inject |
 
 ## What is translated
 
-- Light DOM + **open shadow roots**
-- **All frames** (panel only in top frame)
+- Light DOM + **open shadow roots** (all frames)
 - Attributes: `title`, `alt`, `aria-label`, `placeholder`, `aria-description`
-- Dynamic content via rate-limited `MutationObserver` (childList, attributes, **characterData**)
+- Dynamic content via rate-limited `MutationObserver`
 
 Skipped: code/inputs/svg/math/contenteditable, `.notranslate`, URLs/emails, likely-English strings, already-translated fingerprints.
 
-## Reliability & privacy (v1.3)
+## v1.4 highlights (G / H / I)
 
-- Generation-guarded applies (no restore races)
-- Global SW rate limit + cache + 403/429 retries
-- Per-site minimize / hide / auto override
-- `chrome.storage.onChanged` multi-tab UI sync
-- Default denylist always merged (Web Store hosts)
-- Sensitive hosts: **auto-translate blocked**
-- Closed shadow panel (page JS cannot reach UI)
-- Payload size limits + response shape checks in SW
+- **G** — Yielding DOM collection, single compiled marker regex, capped tracking maps, toasts always auto-hide  
+- **H** — Confidence-scored language detection; auto only when confident; per-site Force DE/EN  
+- **I** — Draggable panel, light/dark theme, progress bar, Expand + Translate when minimized, toolbar failure messages, extension-reload toast, keyboard shortcut  
 
 See [PRIVACY.md](./PRIVACY.md).
 
 ## Limitations
 
-- Closed shadow roots on the **page** cannot be read (platform).
+- Closed shadow roots on the **page** cannot be read.
 - Unofficial Google endpoint may rate-limit; personal use only.
-- SPA re-renders: restore only tracks current session nodes.
 - Restricted pages (`chrome://`, etc.) cannot be scripted.
-
-## Files
-
-| File | Role |
-|------|------|
-| `manifest.json` | MV3 v1.3.0 |
-| `background.js` | Translate queue, cache, broadcast, validation |
-| `content.js` | DOM, observer, prefs, privacy, closed-shadow UI |
-| `content.css` | Panel styles (loaded into shadow) |
-| `PRIVACY.md` | Privacy policy |
-| `icons/` | Toolbar icons |
 
 ## Storage keys
 
 | Key | Meaning |
 |-----|---------|
-| `deEnAutoMode` | Global auto boolean |
-| `deEnPrivacyAccepted` | User accepted privacy notice |
-| `deEnSitePrefs` | `{ [hostname]: { minimized, hidden, auto } }` |
-| `deEnHiddenHosts` | Flat list of hidden hosts (unioned with defaults) |
+| `deEnAutoMode` | Global auto |
+| `deEnPrivacyAccepted` | Privacy consent |
+| `deEnTheme` | `auto` \| `dark` \| `light` |
+| `deEnSitePrefs` | `{ [host]: { minimized, hidden, auto, lang, pos } }` |
+| `deEnHiddenHosts` | Flat hidden-host list |
 
 ## License
 
