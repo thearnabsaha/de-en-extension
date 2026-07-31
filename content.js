@@ -15,8 +15,25 @@
   const ATTRS_TO_TRANSLATE = [
     "title", "alt", "aria-label", "placeholder", "aria-description",
   ];
-  // L: high-entropy pack id + index markers; never use plain fixed tokens alone
-  const MARKER_TOKEN = "\uE000DEEN\uE001"; // private-use chars (unlikely in pages)
+  // Shared modules loaded first via manifest (N)
+  const DeEn = globalThis.DeEn || {};
+  const Msg = DeEn.Msg || {};
+  const Markers = DeEn.markers || null;
+  const LangShared = DeEn.lang || null;
+  const StorageKeys = DeEn.StorageKeys || {
+    AUTO_MODE: "deEnAutoMode",
+    PRIVACY_ACCEPTED: "deEnPrivacyAccepted",
+    THEME: "deEnTheme",
+    SITE_PREFS: "deEnSitePrefs",
+    HIDDEN_HOSTS: "deEnHiddenHosts",
+  };
+  const checkMsg = DeEn.checkMsg || (() => true);
+  const makeMsg =
+    DeEn.msg ||
+    function (type, payload) {
+      return Object.assign({ v: 1, type: type }, payload || {});
+    };
+
   const MAX_PACK_CHARS = 1800;
   let packSeq = 0;
   const MAX_ENCODED_HINT = 3400;
@@ -163,29 +180,10 @@
 
   /** H: confidence-scored detection */
   function scoreGermanText(text) {
-    if (!text || text.length < 8) {
-      return { isGerman: false, confidence: 0, deHits: 0, enHits: 0, umlauts: 0 };
+    if (LangShared && LangShared.scoreGermanText) {
+      return LangShared.scoreGermanText(text);
     }
-    const deHits = countMatches(DE_WORDS, text);
-    const enHits = countMatches(EN_WORDS, text);
-    const umlauts = (text.match(/[äöüÄÖÜß]/g) || []).length;
-    // compound-ish long tokens common in DE
-    const longCompounds = (text.match(/\b[A-ZÄÖÜ][a-zäöüß]{10,}\b/g) || []).length;
-
-    let score = 0;
-    score += Math.min(deHits, 20) * 0.04;
-    score += Math.min(umlauts, 12) * 0.05;
-    score += Math.min(longCompounds, 6) * 0.03;
-    score -= Math.min(enHits, 20) * 0.035;
-    score = Math.max(0, Math.min(1, score));
-
-    // strong signals
-    if (umlauts >= 3 && deHits >= 2) score = Math.max(score, 0.72);
-    if (deHits >= 6 && deHits > enHits) score = Math.max(score, 0.65);
-    if (enHits >= 8 && enHits > deHits * 2 && umlauts === 0) score = Math.min(score, 0.25);
-
-    const isGerman = score >= 0.42 && (deHits + umlauts) >= 2;
-    return { isGerman, confidence: score, deHits, enHits, umlauts };
+    return { isGerman: false, confidence: 0, deHits: 0, enHits: 0, umlauts: 0 };
   }
 
   function looksMostlyEnglish(text) {
@@ -312,23 +310,23 @@
     sensitiveSite = isSensitiveHost(host);
     try {
       const stored = await chrome.storage.local.get([
-        "deEnAutoMode", "deEnSitePrefs", "deEnHiddenHosts",
-        "deEnPrivacyAccepted", "deEnTheme",
+        StorageKeys.AUTO_MODE, StorageKeys.SITE_PREFS, StorageKeys.HIDDEN_HOSTS,
+        StorageKeys.PRIVACY_ACCEPTED, StorageKeys.THEME,
       ]);
-      globalAutoMode = !!stored.deEnAutoMode;
-      privacyAccepted = !!stored.deEnPrivacyAccepted;
-      themeMode = stored.deEnTheme === "light" || stored.deEnTheme === "dark"
-        ? stored.deEnTheme : "auto";
+      globalAutoMode = !!stored[StorageKeys.AUTO_MODE];
+      privacyAccepted = !!stored[StorageKeys.PRIVACY_ACCEPTED];
+      themeMode = stored[StorageKeys.THEME] === "light" || stored[StorageKeys.THEME] === "dark"
+        ? stored[StorageKeys.THEME] : "auto";
 
-      const sitePrefs = stored.deEnSitePrefs && typeof stored.deEnSitePrefs === "object"
-        ? stored.deEnSitePrefs : {};
+      const sitePrefs = stored[StorageKeys.SITE_PREFS] && typeof stored[StorageKeys.SITE_PREFS] === "object"
+        ? stored[StorageKeys.SITE_PREFS] : {};
       const site = sitePrefs[host] || {};
       panelMinimized = site.minimized != null ? !!site.minimized : false;
       siteAutoOverride = site.auto === true ? true : site.auto === false ? false : null;
       siteLangOverride = site.lang === "de" || site.lang === "en" ? site.lang : null;
       panelPos = site.pos && typeof site.pos.top === "number" ? site.pos : null;
 
-      const userHidden = Array.isArray(stored.deEnHiddenHosts) ? stored.deEnHiddenHosts : [];
+      const userHidden = Array.isArray(stored[StorageKeys.HIDDEN_HOSTS]) ? stored[StorageKeys.HIDDEN_HOSTS] : [];
       const hiddenSet = new Set([...DEFAULT_HIDDEN_HOSTS, ...userHidden]);
       hiddenOnSite = !!site.hidden || hiddenSet.has(host);
       autoMode = computeEffectiveAuto();
@@ -352,12 +350,12 @@
     if (!host) return;
     let sitePrefs = {};
     try {
-      const stored = await chrome.storage.local.get("deEnSitePrefs");
-      sitePrefs = stored.deEnSitePrefs && typeof stored.deEnSitePrefs === "object"
-        ? { ...stored.deEnSitePrefs } : {};
+      const stored = await chrome.storage.local.get(StorageKeys.SITE_PREFS);
+      sitePrefs = stored[StorageKeys.SITE_PREFS] && typeof stored[StorageKeys.SITE_PREFS] === "object"
+        ? { ...stored[StorageKeys.SITE_PREFS] } : {};
     } catch { sitePrefs = {}; }
     sitePrefs[host] = { ...(sitePrefs[host] || {}), ...patch };
-    await chrome.storage.local.set({ deEnSitePrefs: sitePrefs });
+    await chrome.storage.local.set({ [StorageKeys.SITE_PREFS]: sitePrefs });
   }
 
   async function setHiddenOnThisSite(hide) {
@@ -366,11 +364,11 @@
     hiddenOnSite = hide;
     await patchSitePrefs({ hidden: hide });
     try {
-      const stored = await chrome.storage.local.get("deEnHiddenHosts");
-      let list = Array.isArray(stored.deEnHiddenHosts) ? stored.deEnHiddenHosts.slice() : [];
+      const stored = await chrome.storage.local.get(StorageKeys.HIDDEN_HOSTS);
+      let list = Array.isArray(stored[StorageKeys.HIDDEN_HOSTS]) ? stored[StorageKeys.HIDDEN_HOSTS].slice() : [];
       if (hide) { if (!list.includes(host)) list.push(host); }
       else list = list.filter((h) => h !== host);
-      await chrome.storage.local.set({ deEnHiddenHosts: list });
+      await chrome.storage.local.set({ [StorageKeys.HIDDEN_HOSTS]: list });
     } catch { /* ignore */ }
   }
   async function setMinimized(min) {
@@ -389,12 +387,12 @@
   }
   async function setGlobalAuto(on) {
     globalAutoMode = on;
-    await chrome.storage.local.set({ deEnAutoMode: on });
+    await chrome.storage.local.set({ [StorageKeys.AUTO_MODE]: on });
     autoMode = computeEffectiveAuto();
   }
   async function setTheme(mode) {
     themeMode = mode;
-    await chrome.storage.local.set({ deEnTheme: mode });
+    await chrome.storage.local.set({ [StorageKeys.THEME]: mode });
     applyTheme();
   }
   async function savePanelPos(pos) {
@@ -405,11 +403,10 @@
   function pushActionState(extra = {}) {
     if (!IS_TOP) return;
     try {
-      chrome.runtime.sendMessage({
-        type: "DE_EN_ACTION_STATE",
+      chrome.runtime.sendMessage(makeMsg(Msg.ACTION_STATE || "DE_EN_ACTION_STATE", {
         translated, auto: autoMode, error: lastError,
         sensitive: sensitiveSite, errorDetail: lastErrorDetail, ...extra,
-      });
+      }));
     } catch { /* ignore */ }
   }
 
@@ -417,22 +414,22 @@
     if (area !== "local") return;
     const host = hostname();
     let need = false;
-    if (changes.deEnAutoMode) {
-      globalAutoMode = !!changes.deEnAutoMode.newValue;
+    if (changes[StorageKeys.AUTO_MODE]) {
+      globalAutoMode = !!changes[StorageKeys.AUTO_MODE].newValue;
       autoMode = computeEffectiveAuto();
       need = true;
     }
-    if (changes.deEnPrivacyAccepted) {
-      privacyAccepted = !!changes.deEnPrivacyAccepted.newValue;
+    if (changes[StorageKeys.PRIVACY_ACCEPTED]) {
+      privacyAccepted = !!changes[StorageKeys.PRIVACY_ACCEPTED].newValue;
       need = true;
     }
-    if (changes.deEnTheme) {
-      themeMode = changes.deEnTheme.newValue || "auto";
+    if (changes[StorageKeys.THEME]) {
+      themeMode = changes[StorageKeys.THEME].newValue || "auto";
       applyTheme();
       need = true;
     }
-    if (changes.deEnSitePrefs) {
-      const site = (changes.deEnSitePrefs.newValue || {})[host] || {};
+    if (changes[StorageKeys.SITE_PREFS]) {
+      const site = (changes[StorageKeys.SITE_PREFS].newValue || {})[host] || {};
       if (site.minimized != null) panelMinimized = !!site.minimized;
       if (site.hidden != null) hiddenOnSite = !!site.hidden;
       siteAutoOverride = site.auto === true ? true : site.auto === false ? false : null;
@@ -442,7 +439,7 @@
       langDetectCache = null;
       need = true;
     }
-    if (changes.deEnHiddenHosts) {
+    if (changes[StorageKeys.HIDDEN_HOSTS]) {
       loadPrefs().then(() => { syncPanelControls(); applyPanelVisibility(); applyPanelPosition(); pushActionState(); });
       return;
     }
@@ -572,67 +569,29 @@
     return items;
   }
 
-  /** L: strip/neutralize sequences that could collide with our markers */
   function sanitizeForPack(text) {
-    if (!text) return text;
-    // Neutralize private-use marker token and any legacy DEEN marker shapes
-    return String(text)
-      .replace(/\uE000DEEN\uE001/g, "\uE002DEEN\uE002")
-      .replace(/\u2060⟦DEEN:\d+⟧\u2060/g, (m) => m.replace(/DEEN/g, "D·E·N"));
-  }
-
-  function makeMarker(packId, index) {
-    // Format: <PU>DEEN<PU>packId:index:checksum<PU>
-    const body = packId + ":" + index;
-    const sum = hashStr(body).slice(0, 4);
-    return MARKER_TOKEN + body + ":" + sum + MARKER_TOKEN;
+    if (Markers && Markers.sanitizeForPack) return Markers.sanitizeForPack(text);
+    return text;
   }
 
   function packChunk(items) {
-    const packId = (packSeq++).toString(36) + "x" + hashStr(String(Date.now())).slice(0, 4);
-    const values = items.map((it) => sanitizeForPack(it.value));
-    // Attach packId on items for unpack
+    const packId = Markers && Markers.newPackId
+      ? Markers.newPackId(packSeq++)
+      : (packSeq++).toString(36) + "x" + hashStr(String(Date.now())).slice(0, 4);
+    const values = items.map((it) => it.value);
     items._packId = packId;
-    items._packedValues = values;
-    if (values.length === 1) return values[0];
-    let out = values[0];
-    for (let i = 0; i < values.length - 1; i++) {
-      out += makeMarker(packId, i) + values[i + 1];
+    if (Markers && Markers.packValues) {
+      return Markers.packValues(values, packId);
     }
-    return out;
+    return values.join("\n");
   }
 
   function unpackChunk(translatedFull, count, packId) {
+    if (Markers && Markers.unpackValues) {
+      return Markers.unpackValues(translatedFull, count, packId);
+    }
     if (count === 1) return [translatedFull == null ? "" : translatedFull];
-    if (!packId) throw new Error("Marker remap failed: missing pack id");
-    const re = new RegExp(
-      MARKER_TOKEN.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
-        packId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
-        ":(\\d+):([a-z0-9]+)" +
-        MARKER_TOKEN.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
-      "g"
-    );
-    const parts = [];
-    let last = 0;
-    let m;
-    const src = translatedFull || "";
-    let expectedIdx = 0;
-    while ((m = re.exec(src)) !== null) {
-      parts.push(src.slice(last, m.index));
-      const idx = parseInt(m[1], 10);
-      if (idx !== expectedIdx) {
-        throw new Error("Marker remap failed: index gap at " + expectedIdx);
-      }
-      expectedIdx++;
-      last = m.index + m[0].length;
-    }
-    parts.push(src.slice(last));
-    if (parts.length !== count) {
-      throw new Error(
-        "Marker remap failed: expected " + count + " parts, got " + parts.length
-      );
-    }
-    return parts;
+    throw new Error("Marker remap failed: markers module missing");
   }
 
   function splitOnBoundaries(text, maxChars) {
@@ -754,7 +713,7 @@
           resolve(local);
           return;
         }
-        chrome.runtime.sendMessage({ type: "DE_EN_TRANSLATE", text }, (res) => {
+        chrome.runtime.sendMessage(makeMsg(Msg.TRANSLATE || "DE_EN_TRANSLATE", { text }), (res) => {
           if (chrome.runtime.lastError) {
             reject(new Error(chrome.runtime.lastError.message));
             return;
@@ -789,7 +748,7 @@
             return;
           }
         }
-        chrome.runtime.sendMessage({ type: "DE_EN_TRANSLATE_BATCH", texts }, (res) => {
+        chrome.runtime.sendMessage(makeMsg(Msg.TRANSLATE_BATCH || "DE_EN_TRANSLATE_BATCH", { texts }), (res) => {
           if (chrome.runtime.lastError) {
             reject(new Error(chrome.runtime.lastError.message));
             return;
@@ -969,8 +928,8 @@
     if (privacyAccepted) return true;
     if (!IS_TOP) {
       try {
-        const s = await chrome.storage.local.get("deEnPrivacyAccepted");
-        privacyAccepted = !!s.deEnPrivacyAccepted;
+        const s = await chrome.storage.local.get(StorageKeys.PRIVACY_ACCEPTED);
+        privacyAccepted = !!s[StorageKeys.PRIVACY_ACCEPTED];
       } catch { /* ignore */ }
       return privacyAccepted;
     }
@@ -981,7 +940,7 @@
 
   async function acceptPrivacy() {
     privacyAccepted = true;
-    await chrome.storage.local.set({ deEnPrivacyAccepted: true });
+    await chrome.storage.local.set({ [StorageKeys.PRIVACY_ACCEPTED]: true });
     showPrivacyPrompt(false);
     showBadge("Privacy accepted — translating…");
     if (!translated && phase === "idle") await translatePage();
@@ -1200,7 +1159,7 @@
     if (IS_TOP) {
       try {
         await new Promise((resolve) => {
-          chrome.runtime.sendMessage({ type: "DE_EN_BROADCAST_TOGGLE" }, () => resolve());
+          chrome.runtime.sendMessage(makeMsg(Msg.BROADCAST_TOGGLE || "DE_EN_BROADCAST_TOGGLE"), () => resolve());
         });
         return;
       } catch { /* fall through */ }
@@ -1851,15 +1810,19 @@
 
   function onRuntimeMessage(msg, _sender, sendResponse) {
     if (!msg || !msg.type) return;
-    if (msg.type === "DE_EN_PING") {
+    if (!checkMsg(msg)) {
+      sendResponse({ ok: false, error: "protocol version mismatch" });
+      return false;
+    }
+    if (msg.type === (Msg.PING || "DE_EN_PING")) {
       sendResponse({ ok: true, translated, autoMode, phase, sensitive: sensitiveSite });
       return false;
     }
-    if (msg.type === "DE_EN_TOGGLE") {
+    if (msg.type === (Msg.TOGGLE || "DE_EN_TOGGLE")) {
       runToggleLocal().then(() => sendResponse({ ok: true, translated, phase }));
       return true;
     }
-    if (msg.type === "DE_EN_SHOW_PANEL") {
+    if (msg.type === (Msg.SHOW_PANEL || "DE_EN_SHOW_PANEL")) {
       if (IS_TOP) {
         setHiddenOnThisSite(false).then(() => setMinimized(false).then(() => {
           applyPanelVisibility(); syncPanelControls();
@@ -1868,7 +1831,7 @@
       sendResponse({ ok: true });
       return false;
     }
-    if (msg.type === "DE_EN_TOOLBAR_FAIL") {
+    if (msg.type === (Msg.TOOLBAR_FAIL || "DE_EN_TOOLBAR_FAIL")) {
       if (IS_TOP) showBadge(msg.reason || "Cannot run on this page", 5000);
       sendResponse({ ok: true });
       return false;
@@ -1932,8 +1895,8 @@
     const det = detectPageLanguage(true);
 
     try {
-      const stored = await chrome.storage.local.get("deEnSitePrefs");
-      const site = ((stored.deEnSitePrefs || {})[hostname()] || {});
+      const stored = await chrome.storage.local.get(StorageKeys.SITE_PREFS);
+      const site = ((stored[StorageKeys.SITE_PREFS] || {})[hostname()] || {});
       if (site.minimized == null && IS_TOP && !det.isGerman && !autoMode) {
         panelMinimized = true;
       }

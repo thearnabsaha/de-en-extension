@@ -2,6 +2,18 @@
 // Rate-limited + cached translation, frame broadcast, action badge,
 // message validation (F3), privacy-sensitive host checks (F2).
 
+importScripts(
+  "shared/protocol.js",
+  "shared/markers.js",
+  "shared/lang.js",
+  "shared/storage-keys.js"
+);
+
+const Msg = (self.DeEn && self.DeEn.Msg) || {};
+const checkMsg = (self.DeEn && self.DeEn.checkMsg) || (() => true);
+const softRedactPII =
+  (self.DeEn && self.DeEn.lang && self.DeEn.lang.softRedactPII) || ((t) => t);
+
 const TRANSLATE_ENDPOINT =
   "https://translate.googleapis.com/translate_a/single?client=gtx&sl=de&tl=en&dt=t&q=";
 
@@ -148,7 +160,8 @@ function validateText(text) {
 }
 
 async function translateText(text) {
-  const s = validateText(text);
+  // O: soft-redact emails/phones before network
+  const s = validateText(softRedactPII(text));
   if (!s.trim()) return s;
 
   const cached = cacheGet(s);
@@ -212,7 +225,7 @@ async function translateBatch(texts) {
 }
 
 async function pingContent(tabId) {
-  return chrome.tabs.sendMessage(tabId, { type: "DE_EN_PING" });
+  return chrome.tabs.sendMessage(tabId, { type: Msg.PING || "DE_EN_PING", v: 1 });
 }
 
 async function ensureContentScript(tabId) {
@@ -235,7 +248,13 @@ async function ensureContentScript(tabId) {
   try {
     await chrome.scripting.executeScript({
       target: { tabId, allFrames: true },
-      files: ["content.js"],
+      files: [
+        "shared/protocol.js",
+        "shared/markers.js",
+        "shared/lang.js",
+        "shared/storage-keys.js",
+        "content.js",
+      ],
     });
   } catch {
     return false;
@@ -304,7 +323,8 @@ async function reportToolbarFailure(tabId, reason) {
   }
   try {
     await chrome.tabs.sendMessage(tabId, {
-      type: "DE_EN_TOOLBAR_FAIL",
+      type: Msg.TOOLBAR_FAIL || "DE_EN_TOOLBAR_FAIL",
+      v: 1,
       reason,
     });
   } catch {
@@ -326,7 +346,7 @@ async function broadcastToggle(tabId) {
   await Promise.all(
     frameIds.map((frameId) =>
       chrome.tabs
-        .sendMessage(tabId, { type: "DE_EN_TOGGLE" }, { frameId })
+        .sendMessage(tabId, { type: Msg.TOGGLE || "DE_EN_TOGGLE", v: 1 }, { frameId })
         .catch(() => {})
     )
   );
@@ -389,8 +409,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: false, error: "untrusted sender" });
     return false;
   }
+  // N: protocol version gate
+  if (!checkMsg(msg)) {
+    sendResponse({ ok: false, error: "protocol version mismatch" });
+    return false;
+  }
 
-  if (msg.type === "DE_EN_TRANSLATE") {
+  const t = msg.type;
+
+  if (t === (Msg.TRANSLATE || "DE_EN_TRANSLATE")) {
     translateText(msg.text)
       .then((translated) => sendResponse({ ok: true, translated }))
       .catch((err) =>
@@ -402,7 +429,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg.type === "DE_EN_TRANSLATE_BATCH") {
+  if (t === (Msg.TRANSLATE_BATCH || "DE_EN_TRANSLATE_BATCH")) {
     const texts = Array.isArray(msg.texts) ? msg.texts : [];
     translateBatch(texts)
       .then((results) => sendResponse({ ok: true, results }))
@@ -415,7 +442,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg.type === "DE_EN_BROADCAST_TOGGLE") {
+  if (t === (Msg.BROADCAST_TOGGLE || "DE_EN_BROADCAST_TOGGLE")) {
     const tabId = sender.tab && sender.tab.id;
     if (tabId == null) {
       sendResponse({ ok: false });
@@ -427,7 +454,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return true;
   }
 
-  if (msg.type === "DE_EN_CHECK_SENSITIVE") {
+  if (t === (Msg.CHECK_SENSITIVE || "DE_EN_CHECK_SENSITIVE")) {
     const host = (msg.host || (sender.tab && sender.tab.url) || "").toString();
     let hostname = host;
     try {
@@ -439,7 +466,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
 
-  if (msg.type === "DE_EN_ACTION_STATE") {
+  if (t === (Msg.ACTION_STATE || "DE_EN_ACTION_STATE")) {
     const tabId = sender.tab && sender.tab.id;
     if (tabId != null) {
       setActionBadge(tabId, {

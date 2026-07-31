@@ -2,7 +2,7 @@
 
 Toggle-translate any webpage from **German to English**, in place. Free — no API key (Google public translate endpoint via the extension service worker).
 
-**v1.5** — a11y (focus, live regions, labels), SW fetch timeouts, Chrome Translator API fallback when available, safer high-entropy markers with per-item fallback.
+**v1.6** — architecture: `shared/` modules, versioned message protocol, unit tests (`npm test`), storage key catalog, NON_BUGS/ARCHITECTURE/SEVERITY docs, soft PII redaction before network.
 
 ## Install (unpacked)
 
@@ -34,16 +34,23 @@ Toggle-translate any webpage from **German to English**, in place. Free — no A
 
 Skipped: code/inputs/svg/math/contenteditable, `.notranslate`, URLs/emails, likely-English strings, already-translated fingerprints.
 
-## Highlights (G–L)
+## Docs
 
-- **G** — Yielding DOM walks, capped maps, toast auto-hide  
-- **H** — Confidence language detection; Force DE/EN per site  
-- **I** — Drag, theme, progress, Expand/Translate, Alt+Shift+T, toolbar errors  
-- **J** — Focus management, SR live region, richer aria-labels, focus-visible  
-- **K** — 12s fetch timeout, on-device Translator API when present, reload banner  
-- **L** — Private-use high-entropy markers + sanitize + per-item fallback  
+| Doc | Topic |
+|-----|--------|
+| [ARCHITECTURE.md](./ARCHITECTURE.md) | Layout, data flow, protocol |
+| [NON_BUGS.md](./NON_BUGS.md) | Intentional limits (section M) |
+| [SEVERITY.md](./SEVERITY.md) | Audit status (section O) |
+| [PRIVACY.md](./PRIVACY.md) | Privacy policy |
 
-See [PRIVACY.md](./PRIVACY.md).
+## Develop
+
+```bash
+npm test          # unit tests for markers / lang / protocol
+npm run check     # syntax check
+```
+
+Load **one** unpacked path only (avoid Desktop + Downloads duplicates).
 
 ## Limitations
 

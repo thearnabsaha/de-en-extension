@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DE → EN Page Translator",
-  "version": "1.5.0",
-  "description": "Toggle-translate German pages to English in place. Per-site prefs, privacy, SPA observer, a11y, robust markers, on-device fallback when available.",
+  "version": "1.6.0",
+  "description": "Toggle-translate German pages to English in place. Shared modules, unit tests, protocol versioning, privacy redaction.",
   "permissions": ["activeTab", "scripting", "storage", "webNavigation"],
   "host_permissions": ["https://translate.googleapis.com/*"],
   "background": {
@@ -11,7 +11,13 @@
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["content.js"],
+      "js": [
+        "shared/protocol.js",
+        "shared/markers.js",
+        "shared/lang.js",
+        "shared/storage-keys.js",
+        "content.js"
+      ],
       "run_at": "document_idle",
       "all_frames": true
     }

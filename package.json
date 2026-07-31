@@ -1,0 +1,13 @@
+{
+  "name": "de-en-extension",
+  "version": "1.6.0",
+  "private": true,
+  "description": "Chrome MV3 DE→EN page translator (unpacked)",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "check": "node --check background.js && node --check content.js && node --check shared/protocol.js && node --check shared/markers.js && node --check shared/lang.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
