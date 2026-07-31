@@ -7,25 +7,53 @@
     try { window.__deEnCleanup(); } catch { /* ignore */ }
   }
 
-  /** Skip text-node collection / subtree walk for these (values stay untranslated). */
-  const SKIP_TAGS = new Set([
-    "SCRIPT", "STYLE", "NOSCRIPT", "SVG", "CODE", "PRE",
-    "TEXTAREA", "INPUT", "IFRAME", "CANVAS", "SELECT", "OPTION",
-    "KBD", "SAMP", "MATH", "TEMPLATE", "OBJECT", "EMBED",
-  ]);
   /**
-   * Fully skip attribute collection (not form controls — those need placeholder).
-   * INPUT/TEXTAREA/SELECT are intentionally NOT here.
+   * Tags whose *text nodes* must not be rewritten (not UI chrome).
+   * INPUT has no text children; TEXTAREA's text child IS the field value — skip.
+   * OPTION/SELECT/BUTTON are translated. SVG text is translated.
    */
-  const SKIP_ATTR_TAGS = new Set([
-    "SCRIPT", "STYLE", "NOSCRIPT", "SVG", "CODE", "PRE",
-    "IFRAME", "CANVAS", "OPTION",
-    "KBD", "SAMP", "MATH", "TEMPLATE", "OBJECT", "EMBED",
+  const SKIP_TEXT_TAGS = new Set([
+    "SCRIPT", "STYLE", "NOSCRIPT", "TEXTAREA",
+    "IFRAME", "CANVAS", "TEMPLATE", "OBJECT", "EMBED",
   ]);
-  const FORM_CONTROL_TAGS = new Set(["INPUT", "TEXTAREA", "SELECT"]);
+  /** Never collect attributes on these. */
+  const SKIP_ATTR_TAGS = new Set([
+    "SCRIPT", "STYLE", "NOSCRIPT", "IFRAME", "CANVAS",
+    "TEMPLATE", "OBJECT", "EMBED",
+  ]);
+  /** Don't descend into these for text (still may open shadow / collect attrs). */
+  const NO_DESCEND_TAGS = new Set([
+    "SCRIPT", "STYLE", "NOSCRIPT", "TEXTAREA", "IFRAME", "CANVAS",
+    "TEMPLATE", "OBJECT", "EMBED",
+  ]);
+  const FORM_CONTROL_TAGS = new Set(["INPUT", "TEXTAREA", "SELECT", "BUTTON"]);
+  const BUTTON_INPUT_TYPES = new Set(["button", "submit", "reset", "image"]);
   const ATTRS_TO_TRANSLATE = [
-    "title", "alt", "aria-label", "placeholder", "aria-description",
+    "title",
+    "alt",
+    "aria-label",
+    "aria-placeholder",
+    "aria-description",
+    "aria-roledescription",
+    "aria-valuetext",
+    "placeholder",
+    "value", // selective — only button-like / readonly labels
+    "data-tooltip",
+    "data-title",
+    "data-original-title",
+    "data-bs-original-title",
+    "data-content",
+    "data-placeholder",
   ];
+  const SHORT_ATTRS = new Set([
+    "placeholder",
+    "aria-label",
+    "aria-placeholder",
+    "title",
+    "value",
+    "alt",
+    "aria-valuetext",
+  ]);
   // Shared modules loaded first via manifest (N)
   const DeEn = globalThis.DeEn || {};
   const Msg = DeEn.Msg || {};
@@ -60,9 +88,9 @@
    * P: cap network chunks per run on huge pages (news sites) to reduce 429 storms.
    * Remaining nodes can be translated via another toggle or SPA observer passes.
    */
-  const MAX_CHUNKS_PER_RUN = 80;
+  const MAX_CHUNKS_PER_RUN = 120;
   /** P: cap work items collected before chunking */
-  const MAX_ITEMS_PER_RUN = 2500;
+  const MAX_ITEMS_PER_RUN = 4000;
 
   const DEFAULT_HIDDEN_HOSTS = [
     "chrome.google.com",
@@ -180,68 +208,157 @@
     }
     return true;
   }
-  function shouldSkipElement(el) {
-    if (!el || !(el instanceof Element)) return true;
-    if (SKIP_TAGS.has(el.tagName)) return true;
-    if (el.id === "__de_en_host") return true;
-    if (el.closest && el.closest("[contenteditable=''], [contenteditable='true']")) return true;
-    if (el.isContentEditable) return true;
-    if (el.closest && el.closest("[data-no-translate], .notranslate, #__de_en_host")) return true;
+
+  /** Popups/modals often mount as display:none — still translate so open state is English. */
+  function isInPopupOrOverlay(el) {
+    if (!el || !el.closest) return false;
+    return !!el.closest(
+      'dialog, [popover], [role="dialog"], [role="alertdialog"], [role="menu"], ' +
+        '[role="listbox"], [role="tooltip"], [role="navigation"], [aria-modal="true"], ' +
+        '[class*="modal" i], [class*="popup" i], [class*="dropdown" i], [class*="popover" i], ' +
+        '[class*="overlay" i], [class*="drawer" i], [class*="toast" i], [data-modal], [data-popup]'
+    );
+  }
+
+  function shouldCollectNode(el) {
+    if (!el) return false;
+    if (el.id === "__de_en_host") return false;
+    if (isVisible(el)) return true;
+    if (isInPopupOrOverlay(el)) return true;
+    if (FORM_CONTROL_TAGS.has(el.tagName)) return true;
+    if (el.tagName === "IMG" || el.tagName === "OPTION") return true;
+    // Hidden labels tied to controls
+    if (el.tagName === "LABEL" || el.tagName === "LEGEND") return true;
     return false;
   }
 
-  /** Allow form controls so placeholder / aria-label / title can be translated. */
+  function isOurUi(el) {
+    if (!el) return true;
+    if (el.id === "__de_en_host") return true;
+    if (el.closest && el.closest("#__de_en_host, [data-no-translate], .notranslate")) return true;
+    return false;
+  }
+
+  /** Skip rewriting text nodes under these parents. */
+  function shouldSkipTextParent(el) {
+    if (!el || !(el instanceof Element)) return true;
+    if (SKIP_TEXT_TAGS.has(el.tagName)) return true;
+    if (isOurUi(el)) return true;
+    // Don't rewrite actively focused fields
+    if (
+      (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable) &&
+      document.activeElement === el
+    ) {
+      return true;
+    }
+    return false;
+  }
+
   function shouldSkipAttrElement(el) {
     if (!el || !(el instanceof Element)) return true;
     if (SKIP_ATTR_TAGS.has(el.tagName)) return true;
-    if (el.id === "__de_en_host") return true;
-    if (el.closest && el.closest("[data-no-translate], .notranslate, #__de_en_host")) {
-      return true;
-    }
-    // Skip password fields' placeholders only if empty — still translate placeholder text
-    // (never touch .value)
+    if (isOurUi(el)) return true;
     return false;
   }
 
-  /**
-   * Read attribute/property to translate. Prefer attribute; fall back to
-   * IDL properties like .placeholder set only via JS.
-   */
+  function shouldDescend(el) {
+    if (!el || !(el instanceof Element)) return false;
+    if (NO_DESCEND_TAGS.has(el.tagName)) return false;
+    if (isOurUi(el)) return false;
+    return true;
+  }
+
+  /** Extension API: open + closed shadow roots. */
+  function getShadowRoot(el) {
+    if (!el) return null;
+    try {
+      if (el.shadowRoot) return el.shadowRoot;
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (typeof chrome !== "undefined" && chrome.dom && chrome.dom.openOrClosedShadowRoot) {
+        return chrome.dom.openOrClosedShadowRoot(el);
+      }
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+
+  function isButtonLikeInput(el) {
+    if (!el || el.tagName !== "INPUT") return false;
+    const t = (el.getAttribute("type") || el.type || "text").toLowerCase();
+    return BUTTON_INPUT_TYPES.has(t);
+  }
+
+  function shouldTranslateValueAttr(el) {
+    if (!el) return false;
+    if (isButtonLikeInput(el)) return true;
+    if (el.tagName === "BUTTON" && el.getAttribute("value")) return true;
+    if (el.tagName === "INPUT" || el.tagName === "TEXTAREA") {
+      const t = (el.getAttribute("type") || el.type || "text").toLowerCase();
+      if (t === "password" || t === "hidden" || t === "file" || t === "checkbox" || t === "radio") {
+        return false;
+      }
+      // Readonly / disabled fields often show fixed German labels as value
+      if (el.readOnly || el.disabled) return true;
+    }
+    if (el.tagName === "OPTION" && el.getAttribute("value") && el.getAttribute("label")) {
+      return false; // prefer text / label attr separately
+    }
+    return false;
+  }
+
   function getTranslatableAttrValue(el, attr) {
+    if (attr === "value" && !shouldTranslateValueAttr(el)) return null;
+
     const fromAttr = el.getAttribute(attr);
     if (fromAttr != null && String(fromAttr).trim()) return String(fromAttr);
 
     if (attr === "placeholder" && typeof el.placeholder === "string" && el.placeholder.trim()) {
       return el.placeholder;
     }
-    if (attr === "title" && typeof el.title === "string" && el.title.trim() && !fromAttr) {
-      // only if no empty attribute — avoid stealing browser default titles
-      return null;
+    if (attr === "value" && shouldTranslateValueAttr(el) && typeof el.value === "string" && el.value.trim()) {
+      return el.value;
     }
-    if (attr === "aria-label") {
-      const al = el.getAttribute("aria-label");
-      if (al != null && al.trim()) return al;
+    if (attr === "title" && typeof el.title === "string" && el.title.trim()) {
+      return el.title;
     }
     return null;
   }
 
   function setTranslatableAttr(el, attr, value) {
-    el.setAttribute(attr, value);
-    // Keep IDL in sync so the browser actually shows translated placeholder
-    if (attr === "placeholder" && "placeholder" in el) {
-      try {
-        el.placeholder = value;
-      } catch {
-        /* ignore */
-      }
+    try {
+      el.setAttribute(attr, value);
+    } catch {
+      /* some attrs readonly */
     }
-    if (attr === "title" && "title" in el) {
-      try {
-        el.title = value;
-      } catch {
-        /* ignore */
-      }
+    try {
+      if (attr === "placeholder" && "placeholder" in el) el.placeholder = value;
+      if (attr === "title" && "title" in el) el.title = value;
+      if (attr === "value" && shouldTranslateValueAttr(el) && "value" in el) el.value = value;
+      if (attr === "alt" && "alt" in el) el.alt = value;
+    } catch {
+      /* ignore */
     }
+  }
+
+  function collectAttrsForElement(el, existingBag) {
+    const pending = {};
+    for (const attr of ATTRS_TO_TRANSLATE) {
+      if (existingBag && existingBag[attr] != null) continue;
+      const val = getTranslatableAttrValue(el, attr);
+      if (!val || !String(val).trim()) continue;
+      if (looksLikeUrlOrCode(val)) continue;
+      // Short UI strings (placeholders, button values) always eligible
+      if (!SHORT_ATTRS.has(attr) && !shouldTranslateText(val)) continue;
+      if (SHORT_ATTRS.has(attr) && /^[\d\s.,:;+%\-–—/\\|()[\]{}$€£¥]+$/.test(val.trim())) {
+        continue;
+      }
+      pending[attr] = val;
+    }
+    return pending;
   }
 
   function countMatches(re, text) {
@@ -311,7 +428,7 @@
         acceptNode(node) {
           if (!node.nodeValue || !node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
           const p = node.parentElement;
-          if (!p || shouldSkipElement(p)) return NodeFilter.FILTER_REJECT;
+          if (!p || shouldSkipTextParent(p)) return NodeFilter.FILTER_REJECT;
           return NodeFilter.FILTER_ACCEPT;
         },
       });
@@ -525,45 +642,12 @@
   try { chrome.storage.onChanged.addListener(onStorageChanged); } catch { /* ignore */ }
 
   // ---------- DOM walk (G1: yield) ----------
-  function walkComposedTreeSync(root, onText, onElement, budget) {
-    // budget = { count, limit, stop:false }
-    if (!root || (budget && budget.stop)) return;
-    const visit = (node) => {
-      if (!node || (budget && budget.stop)) return;
-      if (budget) {
-        budget.count++;
-        if (budget.count >= budget.limit) {
-          budget.stop = true;
-          budget.resumeNode = node;
-          return;
-        }
-      }
-      if (node.nodeType === Node.TEXT_NODE) {
-        onText(node);
-        return;
-      }
-      if (node.nodeType === Node.ELEMENT_NODE) {
-        const el = node;
-        if (onElement) onElement(el);
-        if (shouldSkipElement(el)) return;
-        if (el.shadowRoot) visit(el.shadowRoot);
-        const children = el.childNodes;
-        for (let i = 0; i < children.length; i++) visit(children[i]);
-        return;
-      }
-      if (node.childNodes) {
-        const children = node.childNodes;
-        for (let i = 0; i < children.length; i++) visit(children[i]);
-      }
-    };
-    visit(root);
-  }
-
-  /** Iterative DFS with yields (G1) */
+  /** Iterative DFS with yields — light DOM + open/closed shadow (chrome.dom). */
   async function collectWorkAsync(root, gen) {
     const textNodes = [];
     const attrTargets = [];
     const seenEl = new Set();
+    const seenShadow = new Set();
     const stack = [root];
     let steps = 0;
 
@@ -580,54 +664,58 @@
         const text = node.nodeValue;
         if (!text || !text.trim()) continue;
         const parent = node.parentElement;
-        if (!parent || shouldSkipElement(parent)) continue;
+        if (!parent) continue;
+        // Ancestor text-skip (script/style/textarea only)
         let p = parent;
         let skip = false;
         while (p) {
-          if (p.nodeType === 1 && (SKIP_TAGS.has(p.tagName) || shouldSkipElement(p))) {
-            skip = true; break;
+          if (p.nodeType === 1) {
+            if (SKIP_TEXT_TAGS.has(p.tagName) || isOurUi(p)) {
+              skip = true;
+              break;
+            }
           }
           p = nextAncestor(p);
         }
         if (skip) continue;
-        if (!isVisible(parent)) continue;
+        if (shouldSkipTextParent(parent)) continue;
+        if (!shouldCollectNode(parent)) continue;
         if (originalTextByNode.has(node)) continue;
-        if (!shouldTranslateText(text)) continue;
+        // Short button labels: always try
+        const inButton =
+          parent.closest &&
+          parent.closest("button, [role='button'], a.btn, input, label, option, summary");
+        if (!inButton && !shouldTranslateText(text)) continue;
+        if (inButton && looksLikeUrlOrCode(text)) continue;
         textNodes.push(node);
         continue;
       }
 
       if (node.nodeType === Node.ELEMENT_NODE) {
-        const el = node;
+        const el = /** @type {Element} */ (node);
         if (!seenEl.has(el)) {
           seenEl.add(el);
-          // Form controls (INPUT/TEXTAREA) are skipped for text, but still need
-          // placeholder / aria-label / title translation.
-          const allowAttrs = !shouldSkipAttrElement(el);
-          const visibleEnough =
-            isVisible(el) || el.tagName === "IMG" || FORM_CONTROL_TAGS.has(el.tagName);
-          if (allowAttrs && visibleEnough) {
+          if (!shouldSkipAttrElement(el) && shouldCollectNode(el)) {
             const existing = originalAttrsByEl.get(el) || {};
-            const pending = {};
-            for (const attr of ATTRS_TO_TRANSLATE) {
-              if (existing[attr] != null) continue;
-              const val = getTranslatableAttrValue(el, attr);
-              if (!val || !val.trim()) continue;
-              // Placeholders are often short German words ("Suchen") — still translate
-              if (attr !== "placeholder" && !shouldTranslateText(val)) continue;
-              if (attr === "placeholder" && looksLikeUrlOrCode(val)) continue;
-              pending[attr] = val;
-            }
+            const pending = collectAttrsForElement(el, existing);
             if (Object.keys(pending).length) attrTargets.push({ el, attrs: pending });
           }
         }
-        // Still skip walking text inside inputs/scripts/etc.
-        if (shouldSkipElement(el)) continue;
-        if (el.shadowRoot) stack.push(el.shadowRoot);
+
+        // Open or closed shadow root
+        const sr = getShadowRoot(el);
+        if (sr && !seenShadow.has(sr)) {
+          seenShadow.add(sr);
+          stack.push(sr);
+        }
+
+        if (!shouldDescend(el)) continue;
         const children = el.childNodes;
         for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
         continue;
       }
+
+      // DocumentFragment / ShadowRoot
       if (node.childNodes) {
         const children = node.childNodes;
         for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
@@ -1295,19 +1383,35 @@
       for (const m of mutations) {
         if (m.type === "attributes") {
           const el = m.target;
-          if (!el || el.id === "__de_en_host") continue;
+          if (!el || isOurUi(el)) continue;
+          // Popup open / visibility toggles
+          if (
+            m.attributeName === "open" ||
+            m.attributeName === "popover" ||
+            m.attributeName === "hidden" ||
+            m.attributeName === "aria-hidden" ||
+            m.attributeName === "class" ||
+            m.attributeName === "style"
+          ) {
+            relevant = true;
+            break;
+          }
           if (originalAttrsByEl.has(el)) originalAttrsByEl.delete(el);
-          relevant = true; break;
+          relevant = true;
+          break;
         }
         if (m.type === "characterData") {
           const node = m.target;
           if (node && originalTextByNode.has(node)) originalTextByNode.delete(node);
-          relevant = true; break;
+          relevant = true;
+          break;
         }
         if (m.type === "childList" && m.addedNodes && m.addedNodes.length) {
           for (const n of m.addedNodes) {
-            if (n.nodeType === Node.ELEMENT_NODE && n.id === "__de_en_host") continue;
-            relevant = true; break;
+            if (n.nodeType === Node.ELEMENT_NODE && isOurUi(n)) continue;
+            // New popup nodes / shadow hosts
+            relevant = true;
+            break;
           }
           if (relevant) break;
         }
@@ -1317,8 +1421,19 @@
       mutateTimer = setTimeout(() => scheduleQuietRetranslate(), OBSERVER_DEBOUNCE_MS);
     });
     observer.observe(document.documentElement, {
-      childList: true, subtree: true, characterData: true,
-      attributes: true, attributeFilter: ATTRS_TO_TRANSLATE,
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ATTRS_TO_TRANSLATE.concat([
+        "open",
+        "popover",
+        "hidden",
+        "aria-hidden",
+        "class",
+        "style",
+        "value",
+      ]),
     });
   }
 

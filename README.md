@@ -2,7 +2,7 @@
 
 Toggle-translate any webpage from **German to English**, in place. Free — no API key (Google public translate endpoint via the extension service worker).
 
-**v1.7** — E2E scenario hardening (huge-page caps, clearer progress/errors), documented strengths + five priority fixes, `npm run verify`.
+**v1.8** — E2E scenario hardening (huge-page caps, clearer progress/errors), documented strengths + five priority fixes, `npm run verify`.
 
 ## Install (unpacked)
 
