@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DE → EN Page Translator",
-  "version": "1.4.0",
-  "description": "Toggle-translate German pages to English in place. Per-site prefs, privacy, SPA observer, language confidence, draggable themed panel.",
+  "version": "1.5.0",
+  "description": "Toggle-translate German pages to English in place. Per-site prefs, privacy, SPA observer, a11y, robust markers, on-device fallback when available.",
   "permissions": ["activeTab", "scripting", "storage", "webNavigation"],
   "host_permissions": ["https://translate.googleapis.com/*"],
   "background": {

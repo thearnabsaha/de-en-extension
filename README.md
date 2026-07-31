@@ -2,7 +2,7 @@
 
 Toggle-translate any webpage from **German to English**, in place. Free — no API key (Google public translate endpoint via the extension service worker).
 
-**v1.4** — performance (yielding DOM walks, capped maps), language confidence + per-site override, draggable/themed panel, progress bar, toolbar failure feedback, Alt+Shift+T.
+**v1.5** — a11y (focus, live regions, labels), SW fetch timeouts, Chrome Translator API fallback when available, safer high-entropy markers with per-item fallback.
 
 ## Install (unpacked)
 
@@ -34,11 +34,14 @@ Toggle-translate any webpage from **German to English**, in place. Free — no A
 
 Skipped: code/inputs/svg/math/contenteditable, `.notranslate`, URLs/emails, likely-English strings, already-translated fingerprints.
 
-## v1.4 highlights (G / H / I)
+## Highlights (G–L)
 
-- **G** — Yielding DOM collection, single compiled marker regex, capped tracking maps, toasts always auto-hide  
-- **H** — Confidence-scored language detection; auto only when confident; per-site Force DE/EN  
-- **I** — Draggable panel, light/dark theme, progress bar, Expand + Translate when minimized, toolbar failure messages, extension-reload toast, keyboard shortcut  
+- **G** — Yielding DOM walks, capped maps, toast auto-hide  
+- **H** — Confidence language detection; Force DE/EN per site  
+- **I** — Drag, theme, progress, Expand/Translate, Alt+Shift+T, toolbar errors  
+- **J** — Focus management, SR live region, richer aria-labels, focus-visible  
+- **K** — 12s fetch timeout, on-device Translator API when present, reload banner  
+- **L** — Private-use high-entropy markers + sanitize + per-item fallback  
 
 See [PRIVACY.md](./PRIVACY.md).
 

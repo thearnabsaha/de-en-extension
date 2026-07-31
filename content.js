@@ -15,10 +15,10 @@
   const ATTRS_TO_TRANSLATE = [
     "title", "alt", "aria-label", "placeholder", "aria-description",
   ];
-  // G3: compile once; reset lastIndex before each use
-  const MARKER_RE = /\u2060⟦DEEN:(\d+)⟧\u2060/g;
-  const MARKER = (i) => `\u2060⟦DEEN:${i}⟧\u2060`;
+  // L: high-entropy pack id + index markers; never use plain fixed tokens alone
+  const MARKER_TOKEN = "\uE000DEEN\uE001"; // private-use chars (unlikely in pages)
   const MAX_PACK_CHARS = 1800;
+  let packSeq = 0;
   const MAX_ENCODED_HINT = 3400;
   const CONCURRENCY = 3;
   const MIN_RETRANSLATE_GAP_MS = 1600;
@@ -572,8 +572,67 @@
     return items;
   }
 
+  /** L: strip/neutralize sequences that could collide with our markers */
+  function sanitizeForPack(text) {
+    if (!text) return text;
+    // Neutralize private-use marker token and any legacy DEEN marker shapes
+    return String(text)
+      .replace(/\uE000DEEN\uE001/g, "\uE002DEEN\uE002")
+      .replace(/\u2060⟦DEEN:\d+⟧\u2060/g, (m) => m.replace(/DEEN/g, "D·E·N"));
+  }
+
+  function makeMarker(packId, index) {
+    // Format: <PU>DEEN<PU>packId:index:checksum<PU>
+    const body = packId + ":" + index;
+    const sum = hashStr(body).slice(0, 4);
+    return MARKER_TOKEN + body + ":" + sum + MARKER_TOKEN;
+  }
+
   function packChunk(items) {
-    return items.map((it, i) => it.value + (i < items.length - 1 ? MARKER(i) : "")).join("");
+    const packId = (packSeq++).toString(36) + "x" + hashStr(String(Date.now())).slice(0, 4);
+    const values = items.map((it) => sanitizeForPack(it.value));
+    // Attach packId on items for unpack
+    items._packId = packId;
+    items._packedValues = values;
+    if (values.length === 1) return values[0];
+    let out = values[0];
+    for (let i = 0; i < values.length - 1; i++) {
+      out += makeMarker(packId, i) + values[i + 1];
+    }
+    return out;
+  }
+
+  function unpackChunk(translatedFull, count, packId) {
+    if (count === 1) return [translatedFull == null ? "" : translatedFull];
+    if (!packId) throw new Error("Marker remap failed: missing pack id");
+    const re = new RegExp(
+      MARKER_TOKEN.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+        packId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+        ":(\\d+):([a-z0-9]+)" +
+        MARKER_TOKEN.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+      "g"
+    );
+    const parts = [];
+    let last = 0;
+    let m;
+    const src = translatedFull || "";
+    let expectedIdx = 0;
+    while ((m = re.exec(src)) !== null) {
+      parts.push(src.slice(last, m.index));
+      const idx = parseInt(m[1], 10);
+      if (idx !== expectedIdx) {
+        throw new Error("Marker remap failed: index gap at " + expectedIdx);
+      }
+      expectedIdx++;
+      last = m.index + m[0].length;
+    }
+    parts.push(src.slice(last));
+    if (parts.length !== count) {
+      throw new Error(
+        "Marker remap failed: expected " + count + " parts, got " + parts.length
+      );
+    }
+    return parts;
   }
 
   function splitOnBoundaries(text, maxChars) {
@@ -624,23 +683,7 @@
     return chunks;
   }
 
-  function unpackChunk(translatedFull, count) {
-    if (count === 1) return [translatedFull == null ? "" : translatedFull];
-    MARKER_RE.lastIndex = 0;
-    const parts = [];
-    let last = 0;
-    let m;
-    const src = translatedFull || "";
-    while ((m = MARKER_RE.exec(src)) !== null) {
-      parts.push(src.slice(last, m.index));
-      last = m.index + m[0].length;
-    }
-    parts.push(src.slice(last));
-    if (parts.length !== count) {
-      throw new Error("Marker remap failed: expected " + count + " parts, got " + parts.length);
-    }
-    return parts;
-  }
+  // unpackChunk defined above with packId (L)
 
   // ---------- network ----------
   function friendlyError(err) {
@@ -654,9 +697,63 @@
     return "Translation failed";
   }
 
+  // K3: optional on-device Translator API (Chrome) before network
+  let chromeTranslator = null;
+  let chromeTranslatorTried = false;
+
+  async function getChromeTranslator() {
+    if (chromeTranslatorTried) return chromeTranslator;
+    chromeTranslatorTried = true;
+    try {
+      // K3: Chrome Translator API (when available in the browser)
+      if (typeof globalThis.Translator !== "undefined" && globalThis.Translator.create) {
+        if (globalThis.Translator.availability) {
+          const availability = await globalThis.Translator.availability({
+            sourceLanguage: "de",
+            targetLanguage: "en",
+          });
+          if (availability === "unavailable") return null;
+        }
+        chromeTranslator = await globalThis.Translator.create({
+          sourceLanguage: "de",
+          targetLanguage: "en",
+        });
+        return chromeTranslator;
+      }
+      if (globalThis.translation && typeof globalThis.translation.createTranslator === "function") {
+        chromeTranslator = await globalThis.translation.createTranslator({
+          sourceLanguage: "de",
+          targetLanguage: "en",
+        });
+        return chromeTranslator;
+      }
+    } catch {
+      chromeTranslator = null;
+    }
+    return chromeTranslator;
+  }
+
+  async function translateLocalFirst(text) {
+    try {
+      const tr = await getChromeTranslator();
+      if (tr && typeof tr.translate === "function") {
+        const out = await tr.translate(text);
+        if (typeof out === "string" && out.length) return out;
+      }
+    } catch {
+      /* fall through to network */
+    }
+    return null;
+  }
+
   function translateViaBackground(text) {
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => {
       try {
+        const local = await translateLocalFirst(text);
+        if (local != null) {
+          resolve(local);
+          return;
+        }
         chrome.runtime.sendMessage({ type: "DE_EN_TRANSLATE", text }, (res) => {
           if (chrome.runtime.lastError) {
             reject(new Error(chrome.runtime.lastError.message));
@@ -665,13 +762,33 @@
           if (!res || !res.ok) reject(new Error((res && res.error) || "Translation failed"));
           else resolve(res.translated);
         });
-      } catch (e) { reject(e); }
+      } catch (e) {
+        reject(e);
+      }
     });
   }
 
   function translateBatchViaBackground(texts) {
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => {
       try {
+        // Prefer per-item local when available (K3)
+        const tr = await getChromeTranslator();
+        if (tr && typeof tr.translate === "function") {
+          const results = [];
+          for (const t of texts) {
+            try {
+              const out = await tr.translate(t);
+              results.push({ ok: true, translated: out });
+            } catch (err) {
+              results.push({ ok: false, error: String(err && err.message ? err.message : err) });
+            }
+          }
+          // If all failed, fall through to network batch
+          if (results.some((r) => r.ok)) {
+            resolve(results);
+            return;
+          }
+        }
         chrome.runtime.sendMessage({ type: "DE_EN_TRANSLATE_BATCH", texts }, (res) => {
           if (chrome.runtime.lastError) {
             reject(new Error(chrome.runtime.lastError.message));
@@ -680,7 +797,9 @@
           if (!res || !res.ok) reject(new Error((res && res.error) || "Batch failed"));
           else resolve(res.results || []);
         });
-      } catch (e) { reject(e); }
+      } catch (e) {
+        reject(e);
+      }
     });
   }
 
@@ -812,11 +931,38 @@
     if (items.length === 1 && items[0]._isLargeAttr) {
       await translateLargeAttr(items[0], gen); return;
     }
+
+    // L: single-item packs skip markers entirely
+    if (items.length === 1) {
+      const packed = packChunk(items);
+      const translatedFull = await translateViaBackground(packed);
+      if (!isGenCurrent(gen)) return;
+      applyItemTranslation(items[0], translatedFull, gen);
+      return;
+    }
+
     const packed = packChunk(items);
-    const translatedFull = await translateViaBackground(packed);
-    if (!isGenCurrent(gen)) return;
-    const parts = unpackChunk(translatedFull, items.length);
-    items.forEach((item, i) => applyItemTranslation(item, parts[i], gen));
+    const packId = items._packId;
+    try {
+      const translatedFull = await translateViaBackground(packed);
+      if (!isGenCurrent(gen)) return;
+      const parts = unpackChunk(translatedFull, items.length, packId);
+      items.forEach((item, i) => applyItemTranslation(item, parts[i], gen));
+    } catch (err) {
+      // L: marker failure → fall back to per-item requests (no markers)
+      if (!/Marker remap|timed out|429|403/i.test(String(err && err.message ? err.message : err))) {
+        // still try individual for remap; for other errors rethrow after individuals fail
+      }
+      for (const item of items) {
+        if (!isGenCurrent(gen)) return;
+        try {
+          const solo = await translateViaBackground(sanitizeForPack(item.value));
+          applyItemTranslation(item, solo, gen);
+        } catch {
+          /* leave original for this item */
+        }
+      }
+    }
   }
 
   async function ensurePrivacyAccepted() {
@@ -845,7 +991,19 @@
     if (fabEl) {
       fabEl.classList.toggle("is-english", isEn);
       fabEl.setAttribute("aria-checked", isEn ? "true" : "false");
+      fabEl.setAttribute("aria-pressed", isEn ? "true" : "false");
+      // J: do not rely on color alone
+      fabEl.setAttribute(
+        "aria-label",
+        isEn
+          ? "Showing English. Activate to restore German"
+          : "Showing German. Activate to translate to English"
+      );
     }
+    if (statusLineEl && phase === "idle") {
+      statusLineEl.textContent = isEn ? "Showing English" : "";
+    }
+    announce(isEn ? "Page showing English" : "Page showing German");
   }
   function setUiLoading(on) {
     if (fabEl) {
@@ -853,19 +1011,53 @@
       fabEl.setAttribute("aria-busy", on ? "true" : "false");
     }
   }
+
+  /** J: debounced polite SR announcements (avoid toast spam) */
+  let announceTimer = null;
+  let lastAnnounce = "";
+  function announce(text) {
+    if (!IS_TOP || !shadowRoot || !text) return;
+    if (text === lastAnnounce) return;
+    lastAnnounce = text;
+    clearTimeout(announceTimer);
+    announceTimer = setTimeout(() => {
+      let live = shadowRoot.getElementById("__de_en_sr_live");
+      if (!live) {
+        live = document.createElement("div");
+        live.id = "__de_en_sr_live";
+        live.setAttribute("role", "status");
+        live.setAttribute("aria-live", "polite");
+        live.setAttribute("aria-atomic", "true");
+        live.className = "sr-only";
+        shadowRoot.appendChild(live);
+      }
+      live.textContent = "";
+      // force re-announce
+      requestAnimationFrame(() => {
+        live.textContent = "DE to EN: " + text;
+      });
+    }, 400);
+  }
+
   function setProgress(done, total) {
     if (!progressEl) return;
     if (!total) {
       progressEl.hidden = true;
       progressEl.style.setProperty("--p", "0%");
-      if (statusLineEl) statusLineEl.textContent = "";
+      progressEl.setAttribute("aria-valuenow", "0");
+      if (statusLineEl && phase !== "translating") statusLineEl.textContent = translated ? "Showing English" : "";
       return;
     }
     progressEl.hidden = false;
     const pct = Math.round((done / total) * 100);
     progressEl.style.setProperty("--p", pct + "%");
     progressEl.setAttribute("aria-valuenow", String(pct));
-    if (statusLineEl) statusLineEl.textContent = done + " / " + total;
+    progressEl.setAttribute("aria-valuetext", `Translating ${done} of ${total}`);
+    if (statusLineEl) statusLineEl.textContent = `Translating ${done} / ${total}`;
+    // only announce milestones (J: less SR spam)
+    if (done === 1 || done === total || done % 5 === 0) {
+      announce(`Translating ${done} of ${total}`);
+    }
   }
 
   function pruneDisconnected() {
@@ -1074,14 +1266,13 @@
   // ---------- UI ----------
   function showBadge(text, ms = 2200) {
     if (!IS_TOP || !shadowRoot) return;
-    // G5: always auto-hide (cap stuck toasts)
+    // G5: always auto-hide; J: badge is visual-only (SR uses announce())
     const hideMs = ms > 0 ? ms : 3500;
     let badge = shadowRoot.getElementById("__de_en_translator_badge");
     if (!badge) {
       badge = document.createElement("div");
       badge.id = "__de_en_translator_badge";
-      badge.setAttribute("role", "status");
-      badge.setAttribute("aria-live", "polite");
+      badge.setAttribute("aria-hidden", "true");
       shadowRoot.appendChild(badge);
     }
     badge.textContent = "DE→EN: " + text;
@@ -1089,6 +1280,8 @@
     badge._hideTimer = setTimeout(() => {
       if (badge && badge.parentNode) badge.remove();
     }, hideMs);
+    // important status only (not every progress tick)
+    if (!/^Translating \d+\/\d+/.test(text)) announce(text);
   }
 
   function showPrivacyPrompt(show) {
@@ -1333,6 +1526,56 @@
   border-radius: 50%; background: #fff; display: block; transition: transform .22s ease;
 }
 #__de_en_site_auto_switch.is-on .__de_en_auto_knob { transform: translateX(16px); }
+.sr-only {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0,0,0,0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
+}
+#__de_en_reload_banner {
+  all: initial;
+  display: block;
+  max-width: 220px;
+  margin-bottom: 6px;
+  padding: 8px;
+  border-radius: 10px;
+  background: #b06000;
+  color: #fff;
+  font-size: 11px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.35;
+}
+#__de_en_reload_banner[hidden] { display: none !important; }
+#__de_en_reload_banner button {
+  all: initial;
+  display: inline-block;
+  margin-top: 6px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  background: #fff;
+  color: #111;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+}
+#__de_en_fab:focus-visible,
+#__de_en_auto_switch:focus-visible,
+#__de_en_site_auto_switch:focus-visible,
+#__de_en_min_btn:focus-visible,
+#__de_en_pill:focus-visible,
+#__de_en_pill_toggle:focus-visible,
+#__de_en_hide_site:focus-visible,
+#__de_en_lang_select:focus-visible,
+#__de_en_theme_select:focus-visible {
+  outline: 2px solid #3aa0ff !important;
+  outline-offset: 2px !important;
+}
 #__de_en_pill_toggle {
   all: initial; display: none; margin-left: 6px; cursor: pointer; padding: 2px 6px;
   border-radius: 6px; font-size: 10px; font-weight: 700; color: #fff;
@@ -1405,10 +1648,18 @@
     minBtnEl.type = "button";
     minBtnEl.id = "__de_en_min_btn";
     minBtnEl.textContent = "–";
+    minBtnEl.setAttribute("aria-label", "Minimize translator panel");
     minBtnEl.addEventListener("click", async (e) => {
       e.stopPropagation();
       await setMinimized(!panelMinimized);
       applyPanelVisibility();
+      // J: move focus to expand control when minimized
+      if (panelMinimized) {
+        const expand = shadowRoot && shadowRoot.getElementById("__de_en_pill");
+        if (expand) expand.focus();
+      } else if (fabEl) {
+        fabEl.focus();
+      }
     });
     header.append(dragHandleEl, title, minBtnEl);
     setupDrag(dragHandleEl, panelEl);
@@ -1421,15 +1672,18 @@
     pill.id = "__de_en_pill";
     pill.textContent = "Expand";
     pill.title = "Expand panel";
+    pill.setAttribute("aria-label", "Expand translator panel");
     pill.addEventListener("click", async () => {
       await setMinimized(false);
       applyPanelVisibility();
+      if (fabEl) fabEl.focus(); // J: focus main control after expand
     });
     const pillToggle = document.createElement("button");
     pillToggle.type = "button";
     pillToggle.id = "__de_en_pill_toggle";
     pillToggle.textContent = "Translate";
     pillToggle.title = "Toggle translation";
+    pillToggle.setAttribute("aria-label", "Toggle German to English translation");
     pillToggle.addEventListener("click", (e) => {
       e.stopPropagation();
       runToggle();
@@ -1486,6 +1740,7 @@
     autoSwitchEl.type = "button";
     autoSwitchEl.id = "__de_en_auto_switch";
     autoSwitchEl.setAttribute("role", "switch");
+    autoSwitchEl.setAttribute("aria-label", "Global auto-translate");
     autoSwitchEl.appendChild(Object.assign(document.createElement("span"), { className: "__de_en_auto_knob" }));
     autoSwitchEl.addEventListener("click", async () => {
       if (sensitiveSite) { showBadge("Auto disabled on sensitive sites"); return; }
@@ -1509,6 +1764,8 @@
     siteAutoSwitchEl = document.createElement("button");
     siteAutoSwitchEl.type = "button";
     siteAutoSwitchEl.id = "__de_en_site_auto_switch";
+    siteAutoSwitchEl.setAttribute("role", "switch");
+    siteAutoSwitchEl.setAttribute("aria-label", "Auto-translate on this site");
     siteAutoSwitchEl.appendChild(Object.assign(document.createElement("span"), { className: "__de_en_auto_knob" }));
     siteAutoSwitchEl.addEventListener("click", async () => {
       if (sensitiveSite) { showBadge("Auto disabled on sensitive sites"); return; }
@@ -1620,20 +1877,40 @@
   }
   chrome.runtime.onMessage.addListener(onRuntimeMessage);
 
-  // I7: detect invalidated extension periodically
+  // K5 / I7: detect invalidated extension; show reload banner (not only toast)
+  function showReloadBanner() {
+    if (!IS_TOP || !shadowRoot) return;
+    let banner = shadowRoot.getElementById("__de_en_reload_banner");
+    if (!banner) {
+      banner = document.createElement("div");
+      banner.id = "__de_en_reload_banner";
+      banner.setAttribute("role", "alert");
+      banner.innerHTML =
+        "Extension was updated or reloaded. Controls may be dead until you refresh.";
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.textContent = "Refresh page";
+      btn.addEventListener("click", () => location.reload());
+      banner.appendChild(btn);
+      if (panelEl) panelEl.insertBefore(banner, panelEl.firstChild);
+      else shadowRoot.appendChild(banner);
+    }
+    banner.hidden = false;
+    announce("Extension reloaded. Refresh the page.");
+  }
+
   const aliveTimer = setInterval(() => {
     try {
       if (!chrome.runtime || !chrome.runtime.id) throw new Error("dead");
       void chrome.runtime.getManifest();
     } catch {
       clearInterval(aliveTimer);
-      if (IS_TOP) {
-        try {
-          showBadge("Extension reloaded — refresh page", 8000);
-        } catch { /* ignore */ }
-      }
+      try {
+        showReloadBanner();
+        showBadge("Extension reloaded — refresh page", 8000);
+      } catch { /* ignore */ }
     }
-  }, 15000);
+  }, 12000);
 
   window.__deEnCleanup = () => {
     try {

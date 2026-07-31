@@ -14,6 +14,8 @@ const BASE_BACKOFF_MS = 450;
 
 const MAX_CONCURRENT_FETCHES = 2;
 const MIN_GAP_MS = 120;
+/** K2: hard timeout per network attempt */
+const FETCH_TIMEOUT_MS = 12000;
 
 const CACHE_MAX = 800;
 const translateCache = new Map();
@@ -106,12 +108,22 @@ async function rateLimitedFetch(url) {
       lastFetchAt = Date.now();
 
       let res;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
       try {
-        res = await fetch(url);
+        res = await fetch(url, { signal: ctrl.signal });
       } catch (err) {
+        clearTimeout(timer);
+        const aborted = err && (err.name === "AbortError" || /abort/i.test(String(err)));
+        if (aborted) {
+          lastStatus = 0;
+          if (attempt < MAX_RETRIES) continue;
+          throw new Error("Translate request timed out");
+        }
         if (attempt < MAX_RETRIES) continue;
         throw err;
       }
+      clearTimeout(timer);
 
       lastStatus = res.status;
       if (res.status === 429 || res.status === 403 || res.status >= 500) {
