@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DE → EN Page Translator",
-  "version": "1.6.0",
-  "description": "Toggle-translate German pages to English in place. Shared modules, unit tests, protocol versioning, privacy redaction.",
+  "version": "1.7.0",
+  "description": "Toggle-translate German pages to English in place. E2E scenario hardening, huge-page caps, five priority fixes verified.",
   "permissions": ["activeTab", "scripting", "storage", "webNavigation"],
   "host_permissions": ["https://translate.googleapis.com/*"],
   "background": {

@@ -2,7 +2,7 @@
 
 Toggle-translate any webpage from **German to English**, in place. Free — no API key (Google public translate endpoint via the extension service worker).
 
-**v1.6** — architecture: `shared/` modules, versioned message protocol, unit tests (`npm test`), storage key catalog, NON_BUGS/ARCHITECTURE/SEVERITY docs, soft PII redaction before network.
+**v1.7** — E2E scenario hardening (huge-page caps, clearer progress/errors), documented strengths + five priority fixes, `npm run verify`.
 
 ## Install (unpacked)
 
@@ -39,15 +39,20 @@ Skipped: code/inputs/svg/math/contenteditable, `.notranslate`, URLs/emails, like
 | Doc | Topic |
 |-----|--------|
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | Layout, data flow, protocol |
-| [NON_BUGS.md](./NON_BUGS.md) | Intentional limits (section M) |
-| [SEVERITY.md](./SEVERITY.md) | Audit status (section O) |
+| [NON_BUGS.md](./NON_BUGS.md) | Intentional limits (M) |
+| [SEVERITY.md](./SEVERITY.md) | Audit status (O) |
+| [E2E_SCENARIOS.md](./E2E_SCENARIOS.md) | Failure scenarios (P) |
+| [STRENGTHS.md](./STRENGTHS.md) | What is solid (Q) |
+| [FIVE_FIXES.md](./FIVE_FIXES.md) | Priority five (R) |
 | [PRIVACY.md](./PRIVACY.md) | Privacy policy |
 
 ## Develop
 
 ```bash
-npm test          # unit tests for markers / lang / protocol
-npm run check     # syntax check
+npm test           # unit tests
+npm run check      # syntax check
+npm run verify-five  # R1–R5 still in source
+npm run verify     # check + test + verify-five
 ```
 
 Load **one** unpacked path only (avoid Desktop + Downloads duplicates).

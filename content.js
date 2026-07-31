@@ -45,6 +45,13 @@
   /** G4: hard cap tracked nodes to limit memory */
   const MAX_TRACKED_NODES = 8000;
   const MAX_HASH_SET = 12000;
+  /**
+   * P: cap network chunks per run on huge pages (news sites) to reduce 429 storms.
+   * Remaining nodes can be translated via another toggle or SPA observer passes.
+   */
+  const MAX_CHUNKS_PER_RUN = 80;
+  /** P: cap work items collected before chunking */
+  const MAX_ITEMS_PER_RUN = 2500;
 
   const DEFAULT_HIDDEN_HOSTS = [
     "chrome.google.com",
@@ -1036,20 +1043,28 @@
     }
     if (sensitiveSite && !quiet) showBadge("Sensitive site — manual only");
 
+    // R1: generation token invalidates any in-flight applies from prior runs
     const gen = ++runGeneration;
     phase = "translating";
     lastError = false;
     lastErrorDetail = "";
     setUiLoading(true);
     setProgress(0, 1);
-    if (!quiet) showBadge("Translating…");
+    if (!quiet) showBadge("Scanning page…");
 
     try {
       pruneDisconnected();
       const root = document.body || document.documentElement;
       const { textNodes, attrTargets } = await collectWorkAsync(root, gen);
       if (!isGenCurrent(gen)) return;
-      const items = buildWorkItems(textNodes, attrTargets);
+      let items = buildWorkItems(textNodes, attrTargets);
+
+      // P: huge-page item cap
+      let itemsCapped = false;
+      if (items.length > MAX_ITEMS_PER_RUN) {
+        items = items.slice(0, MAX_ITEMS_PER_RUN);
+        itemsCapped = true;
+      }
 
       if (!items.length) {
         if (!isGenCurrent(gen)) return;
@@ -1061,7 +1076,20 @@
         return;
       }
 
-      const chunks = chunkItems(items);
+      if (!quiet) {
+        showBadge(
+          `Found ${items.length} string${items.length === 1 ? "" : "s"}${itemsCapped ? " (capped)" : ""}…`,
+          2500
+        );
+      }
+
+      let chunks = chunkItems(items);
+      // P: huge-page chunk cap (rate-limit safety)
+      let chunksCapped = false;
+      if (chunks.length > MAX_CHUNKS_PER_RUN) {
+        chunks = chunks.slice(0, MAX_CHUNKS_PER_RUN);
+        chunksCapped = true;
+      }
       const total = chunks.length;
       let done = 0;
       setProgress(0, total);
@@ -1088,9 +1116,13 @@
         showBadge(lastErrorDetail);
         lastError = false;
       } else if (failed >= total && total > 0) {
-        lastErrorDetail = "All chunks failed — rate limit or network?";
+        lastErrorDetail = "All chunks failed — rate limit or network? Toggle again to retry.";
         showBadge(lastErrorDetail, 5000);
         lastError = true;
+      } else if (chunksCapped || itemsCapped) {
+        lastErrorDetail = `Partial: large page — translated first ${total} chunks (toggle again for more)`;
+        showBadge(lastErrorDetail, 5000);
+        lastError = false;
       } else {
         showBadge("Translated to English");
         lastError = false;
@@ -1115,11 +1147,14 @@
   }
 
   async function restorePage() {
+    // R1: bump generation so any in-flight translateChunk applies are ignored
     const gen = ++runGeneration;
     phase = "restoring";
     stopObserver();
     setUiLoading(false);
     setProgress(0, 0);
+    // Yield so pending microtasks see the new generation before we rewrite DOM
+    await Promise.resolve();
     await Promise.resolve();
     withOwnMutation(() => {
       for (const [node, original] of originalTextByNode.entries()) {

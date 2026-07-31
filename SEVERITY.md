@@ -1,6 +1,6 @@
 # Severity master list status (section O)
 
-Snapshot of the original audit priorities and current status as of **v1.6**.
+Snapshot of the original audit priorities and current status as of **v1.7**.
 
 ## P0 — must be solid for daily use
 
