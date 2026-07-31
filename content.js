@@ -1698,7 +1698,7 @@
     fabEl.setAttribute("role", "switch");
     fabEl.setAttribute("aria-checked", "false");
     fabEl.setAttribute("aria-label", "Toggle German to English translation");
-    fabEl.title = "Toggle translation (Alt+Shift+T)";
+    fabEl.title = "Toggle translation (Alt+Shift+B)";
     const left = document.createElement("span");
     left.className = "__de_en_label left";
     left.textContent = "DE";
@@ -1832,12 +1832,12 @@
       }
     });
 
-    // I: keyboard shortcut Alt+Shift+T
+    // I: keyboard shortcut Alt+Shift+B
     window.addEventListener("keydown", onGlobalKey, true);
   }
 
   function onGlobalKey(e) {
-    if (!(e.altKey && e.shiftKey && (e.key === "T" || e.key === "t"))) return;
+    if (!(e.altKey && e.shiftKey && (e.key === "B" || e.key === "b"))) return;
     if (!IS_TOP) return;
     e.preventDefault();
     runToggle();

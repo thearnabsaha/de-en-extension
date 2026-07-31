@@ -19,7 +19,7 @@ de-en-extension/
 
 ## Data flow
 
-1. User toggles (panel / toolbar / Alt+Shift+T).
+1. User toggles (panel / toolbar / Alt+Shift+B).
 2. SW broadcasts `DE_EN_TOGGLE` to all frames (`webNavigation.getAllFrames`).
 3. Each content script collects text/attrs (light DOM + open shadow), chunks them.
 4. Translate path: optional on-device `Translator` API → else SW `DE_EN_TRANSLATE(_BATCH)`.

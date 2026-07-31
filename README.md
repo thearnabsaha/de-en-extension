@@ -16,7 +16,7 @@ Toggle-translate any webpage from **German to English**, in place. Free — no A
 | Control | Action |
 |--------|--------|
 | **DE/EN switch** | Translate ↔ restore. Mid-run click **cancels and restores**. |
-| **Alt+Shift+T** | Toggle translation (also works from toolbar). |
+| **Alt+Shift+B** | Toggle translation (also works from toolbar). |
 | **Auto (global)** | Translate high-confidence German pages automatically. |
 | **Auto on this site** | Cycle: inherit → on → off (red = force off). |
 | **Page language** | Auto / Force DE / Force EN (per site). |

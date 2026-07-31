@@ -318,7 +318,7 @@ function setActionBadge(tabId, { translated, auto, error, sensitive, errorDetail
       chrome.action.setBadgeText({ tabId, text: "" });
       chrome.action.setTitle({
         tabId,
-        title: "Translate page: German → English (Alt+Shift+T)",
+        title: "Translate page: German → English (Alt+Shift+B)",
       });
     }
   } catch {
@@ -400,7 +400,7 @@ chrome.action.onClicked.addListener((tab) => {
   toggleActiveTab(tab);
 });
 
-// Manifest command Alt+Shift+T
+// Manifest command Alt+Shift+B
 if (chrome.commands && chrome.commands.onCommand) {
   chrome.commands.onCommand.addListener(async (command) => {
     if (command !== "toggle-translate") return;

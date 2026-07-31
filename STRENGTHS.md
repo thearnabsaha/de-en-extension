@@ -18,7 +18,7 @@ Honest inventory of strengths in the current design — keep these when refactor
 
 ## Product / UX
 
-- Dual controls: glass panel + toolbar + **Alt+Shift+T**.
+- Dual controls: glass panel + toolbar + **Alt+Shift+B**.
 - **Per-site** minimize / hide / auto / language override / position.
 - **Privacy consent** and **sensitive-site auto-block** before quiet bulk exfil.
 - Closed-shadow panel reduces page CSS/JS interference.

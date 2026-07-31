@@ -31,13 +31,13 @@
   "commands": {
     "toggle-translate": {
       "suggested_key": {
-        "default": "Alt+Shift+T"
+        "default": "Alt+Shift+B"
       },
       "description": "Toggle DE→EN translation on the current tab"
     }
   },
   "action": {
-    "default_title": "Translate page: German → English (Alt+Shift+T)",
+    "default_title": "Translate page: German → English (Alt+Shift+B)",
     "default_icon": {
       "16": "icons/icon16.png",
       "32": "icons/icon32.png",
