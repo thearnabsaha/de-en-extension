@@ -1585,21 +1585,65 @@
     }
   }
 
+  function setPanelFixedPos(left, top) {
+    if (!panelEl) return;
+    // Use setProperty so we always beat stylesheet defaults (and any residual !important)
+    panelEl.style.setProperty("left", Math.round(left) + "px", "important");
+    panelEl.style.setProperty("top", Math.round(top) + "px", "important");
+    panelEl.style.setProperty("right", "auto", "important");
+    panelEl.style.setProperty("bottom", "auto", "important");
+  }
+
+  function clampPanelPos(left, top) {
+    if (!panelEl) return { left, top };
+    const w = panelEl.offsetWidth || 48;
+    const h = panelEl.offsetHeight || 40;
+    // Allow free movement across the viewport; keep at least 32px of the panel visible
+    const minVis = 32;
+    const maxL = Math.max(0, window.innerWidth - minVis);
+    const maxT = Math.max(0, window.innerHeight - minVis);
+    const minL = Math.min(0, window.innerWidth - w);
+    const minT = Math.min(0, window.innerHeight - h);
+    // Prefer keeping fully on-screen when it fits; otherwise allow partial off-screen edges
+    const preferMinL = 4;
+    const preferMinT = 4;
+    const preferMaxL = Math.max(preferMinL, window.innerWidth - w - 4);
+    const preferMaxT = Math.max(preferMinT, window.innerHeight - h - 4);
+    let L = left;
+    let T = top;
+    if (w + 8 < window.innerWidth) {
+      L = Math.max(preferMinL, Math.min(preferMaxL, left));
+    } else {
+      L = Math.max(minL, Math.min(maxL, left));
+    }
+    if (h + 8 < window.innerHeight) {
+      T = Math.max(preferMinT, Math.min(preferMaxT, top));
+    } else {
+      T = Math.max(minT, Math.min(maxT, top));
+    }
+    return { left: L, top: T };
+  }
+
   function applyPanelPosition() {
     if (!panelEl) return;
     if (panelPos && typeof panelPos.top === "number") {
-      panelEl.style.top = panelPos.top + "px";
-      panelEl.style.right = "auto";
-      panelEl.style.left = (panelPos.left != null ? panelPos.left : 16) + "px";
+      const c = clampPanelPos(
+        panelPos.left != null ? panelPos.left : 16,
+        panelPos.top
+      );
+      setPanelFixedPos(c.left, c.top);
     } else {
-      panelEl.style.top = "";
-      panelEl.style.right = "";
-      panelEl.style.left = "";
+      panelEl.style.removeProperty("left");
+      panelEl.style.removeProperty("top");
+      panelEl.style.removeProperty("right");
+      panelEl.style.removeProperty("bottom");
     }
     if (unhideBtnEl && panelPos) {
-      unhideBtnEl.style.top = (panelPos.top || 16) + "px";
-      unhideBtnEl.style.left = (panelPos.left != null ? panelPos.left : "") + "px";
-      unhideBtnEl.style.right = panelPos.left != null ? "auto" : "";
+      unhideBtnEl.style.setProperty("top", (panelPos.top || 16) + "px", "important");
+      if (panelPos.left != null) {
+        unhideBtnEl.style.setProperty("left", panelPos.left + "px", "important");
+        unhideBtnEl.style.setProperty("right", "auto", "important");
+      }
     }
   }
 
@@ -1639,48 +1683,120 @@
     applyTheme();
   }
 
-  function setupDrag(handle, panel) {
+  /**
+   * Drag the floating panel anywhere on screen.
+   * - Explicit move handle always starts a drag
+   * - When minimized, drag from the chrome (not Expand / Translate)
+   */
+  function setupDrag(panel) {
+    if (!panel || panel.dataset.deEnDragBound === "1") return;
+    panel.dataset.deEnDragBound = "1";
+
     let dragging = false;
-    let startX = 0, startY = 0, origL = 0, origT = 0;
+    let pointerId = null;
+    let startX = 0;
+    let startY = 0;
+    let origL = 0;
+    let origT = 0;
+
+    function isInteractiveControl(el) {
+      if (!el || !panel.contains(el)) return false;
+      const id = el.id || "";
+      if (
+        id === "__de_en_pill" ||
+        id === "__de_en_pill_toggle" ||
+        id === "__de_en_min_btn" ||
+        id === "__de_en_fab" ||
+        id === "__de_en_auto_switch" ||
+        id === "__de_en_site_auto_switch" ||
+        id === "__de_en_hide_site" ||
+        id === "__de_en_lang_select" ||
+        id === "__de_en_theme_select" ||
+        id === "__de_en_privacy_accept"
+      ) {
+        return true;
+      }
+      // Labels/rows under controls that shouldn't start a drag
+      if (el.closest && el.closest("button, select, a, input, textarea, option")) {
+        // Allow the dedicated move handle button
+        const btn = el.closest("button");
+        if (btn && (btn.id === "__de_en_drag" || btn.id === "__de_en_pill_drag")) return false;
+        return true;
+      }
+      return false;
+    }
+
+    function shouldStartDrag(target) {
+      if (!target) return false;
+      // Always allow the move grips
+      if (target.id === "__de_en_drag" || target.id === "__de_en_pill_drag") return true;
+      if (target.closest && (target.closest("#__de_en_drag") || target.closest("#__de_en_pill_drag"))) {
+        return true;
+      }
+      // Minimized: drag from anywhere on the pill chrome except Expand/Translate
+      if (panel.classList.contains("is-minimized")) {
+        return !isInteractiveControl(target);
+      }
+      return false;
+    }
+
     const onDown = (e) => {
       if (e.button != null && e.button !== 0) return;
+      const target = e.target;
+      if (!(target instanceof Element)) return;
+      if (!shouldStartDrag(target)) return;
+
       dragging = true;
-      try { handle.setPointerCapture?.(e.pointerId); } catch { /* ignore */ }
+      pointerId = e.pointerId;
+      try {
+        panel.setPointerCapture?.(e.pointerId);
+      } catch { /* ignore */ }
+
       const rect = panel.getBoundingClientRect();
       startX = e.clientX;
       startY = e.clientY;
       origL = rect.left;
       origT = rect.top;
+
+      // Switch from default right-anchored CSS to left/top coords immediately
+      setPanelFixedPos(origL, origT);
       panel.classList.add("is-dragging");
       e.preventDefault();
       e.stopPropagation();
     };
+
     const onMove = (e) => {
       if (!dragging) return;
+      if (pointerId != null && e.pointerId !== pointerId) return;
       const dx = e.clientX - startX;
       const dy = e.clientY - startY;
-      const w = panel.offsetWidth || 200;
-      const h = panel.offsetHeight || 40;
-      // Keep enough of the panel on-screen to grab the move control again
-      const minVisible = 48;
-      let left = Math.max(4 - (w - minVisible), Math.min(window.innerWidth - minVisible, origL + dx));
-      let top = Math.max(4, Math.min(window.innerHeight - Math.min(h, 40), origT + dy));
-      panel.style.left = left + "px";
-      panel.style.top = top + "px";
-      panel.style.right = "auto";
+      const c = clampPanelPos(origL + dx, origT + dy);
+      setPanelFixedPos(c.left, c.top);
+      e.preventDefault();
     };
-    const onUp = (e) => {
+
+    const endDrag = (e) => {
       if (!dragging) return;
+      if (e && pointerId != null && e.pointerId !== pointerId) return;
       dragging = false;
-      try { handle.releasePointerCapture?.(e.pointerId); } catch { /* ignore */ }
+      pointerId = null;
+      try {
+        if (e && e.pointerId != null) panel.releasePointerCapture?.(e.pointerId);
+      } catch { /* ignore */ }
       panel.classList.remove("is-dragging");
       const rect = panel.getBoundingClientRect();
-      savePanelPos({ top: Math.round(rect.top), left: Math.round(rect.left) });
+      const c = clampPanelPos(rect.left, rect.top);
+      setPanelFixedPos(c.left, c.top);
+      savePanelPos({ top: Math.round(c.top), left: Math.round(c.left) });
     };
-    handle.addEventListener("pointerdown", onDown);
-    window.addEventListener("pointermove", onMove);
-    window.addEventListener("pointerup", onUp);
-    window.addEventListener("pointercancel", onUp);
+
+    panel.addEventListener("pointerdown", onDown);
+    panel.addEventListener("pointermove", onMove);
+    panel.addEventListener("pointerup", endDrag);
+    panel.addEventListener("pointercancel", endDrag);
+    // Fallback if capture is lost (some pages steal events)
+    window.addEventListener("pointerup", endDrag);
+    window.addEventListener("pointercancel", endDrag);
   }
 
   async function injectShadowStyles(shadow) {
@@ -1696,12 +1812,43 @@
 
   function extraShadowCss() {
     return `
-#__de_en_host_root { all: initial; }
+/* Host is a zero-size fixed anchor so fixed children free-float on the viewport */
+#__de_en_host {
+  all: initial !important;
+  position: fixed !important;
+  inset: 0 auto auto 0 !important;
+  width: 0 !important;
+  height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: none !important;
+  overflow: visible !important;
+  z-index: 2147483646 !important;
+  pointer-events: none !important;
+}
+#__de_en_host_root {
+  all: initial;
+  pointer-events: none;
+}
+#__de_en_host_root > * {
+  pointer-events: auto;
+}
 #__de_en_panel {
+  position: fixed !important;
+  top: 16px;
+  right: 16px;
+  left: auto;
+  bottom: auto;
   z-index: 2147483000 !important;
   min-width: 200px;
   max-width: min(240px, calc(100vw - 16px));
   width: max-content;
+  pointer-events: auto;
+}
+#__de_en_panel.is-dragging {
+  opacity: .92;
+  cursor: grabbing !important;
+  transition: none !important;
 }
 #__de_en_panel.is-minimized {
   min-width: 0;
@@ -1710,6 +1857,8 @@
   flex-direction: row !important;
   align-items: center;
   gap: 4px;
+  cursor: grab;
+  touch-action: none;
 }
 #__de_en_panel.is-minimized #__de_en_panel_body,
 #__de_en_panel.is-minimized #__de_en_privacy {
@@ -1746,7 +1895,7 @@
   background: rgba(0,0,0,.05) !important;
   border-color: rgba(0,0,0,.08) !important;
 }
-#__de_en_panel.is-dragging { opacity: .92; cursor: grabbing; }
+
 #__de_en_header_actions {
   all: initial;
   display: inline-flex !important;
@@ -1973,6 +2122,21 @@
 
     hostEl = document.createElement("div");
     hostEl.id = "__de_en_host";
+    // Host sits outside the closed shadow — style it in JS so fixed panel can free-float
+    Object.assign(hostEl.style, {
+      all: "initial",
+      position: "fixed",
+      top: "0",
+      left: "0",
+      width: "0",
+      height: "0",
+      margin: "0",
+      padding: "0",
+      border: "none",
+      overflow: "visible",
+      zIndex: "2147483646",
+      pointerEvents: "none",
+    });
     shadowRoot = hostEl.attachShadow({ mode: "closed" });
     await injectShadowStyles(shadowRoot);
 
@@ -2042,7 +2206,7 @@
     headerActions.id = "__de_en_header_actions";
     headerActions.append(dragHandleEl, minBtnEl);
     header.append(title, headerActions);
-    setupDrag(dragHandleEl, panelEl);
+    setupDrag(panelEl);
 
     // I3: minimized row — Expand + Translate; Move stays on header (always visible)
     const pillRow = document.createElement("div");

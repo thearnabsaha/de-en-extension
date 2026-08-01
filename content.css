@@ -1,11 +1,31 @@
 /* DE → EN floating panel + status badge
    Injected into the extension's closed shadow root (and as a page content_style fallback). */
 
+/* Host styles apply only when content.css is injected as a page stylesheet.
+   In the closed shadow, the host is outside — host styles live in extraShadowCss
+   and also here for the light-DOM host element. */
+#__de_en_host {
+  all: initial !important;
+  position: fixed !important;
+  inset: 0 auto auto 0 !important;
+  width: 0 !important;
+  height: 0 !important;
+  margin: 0 !important;
+  padding: 0 !important;
+  border: none !important;
+  overflow: visible !important;
+  z-index: 2147483646 !important;
+  pointer-events: none !important;
+}
+
 #__de_en_panel {
   all: initial;
   position: fixed !important;
-  top: 16px !important;
-  right: 16px !important;
+  /* Do NOT use !important on top/left/right — drag sets them via JS */
+  top: 16px;
+  right: 16px;
+  left: auto;
+  bottom: auto;
   z-index: 2147483647 !important;
   display: flex !important;
   flex-direction: column;
@@ -19,13 +39,20 @@
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.32), 0 0 0 1px rgba(255, 255, 255, 0.04) inset;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   user-select: none;
-  transition: box-shadow .2s ease, padding .2s ease;
+  transition: box-shadow .2s ease, padding .2s ease, opacity .15s ease;
   color: #fff;
   box-sizing: border-box;
   /* Keep controls readable; avoid squashed labels/switches */
   min-width: 200px;
   max-width: min(240px, calc(100vw - 16px));
   width: max-content;
+}
+
+#__de_en_panel.is-dragging {
+  opacity: 0.92;
+  cursor: grabbing !important;
+  transition: none;
+  will-change: left, top;
 }
 
 #__de_en_panel:hover {
@@ -155,6 +182,13 @@
   width: auto;
   flex-direction: row;
   align-items: center;
+  cursor: grab;
+  /* Easier grab target while minimized */
+  touch-action: none;
+}
+
+#__de_en_panel.is-minimized.is-dragging {
+  cursor: grabbing;
 }
 
 /* Minimized: keep Move button; hide title / min / full body */
