@@ -1645,6 +1645,7 @@
     const onDown = (e) => {
       if (e.button != null && e.button !== 0) return;
       dragging = true;
+      try { handle.setPointerCapture?.(e.pointerId); } catch { /* ignore */ }
       const rect = panel.getBoundingClientRect();
       startX = e.clientX;
       startY = e.clientY;
@@ -1652,20 +1653,26 @@
       origT = rect.top;
       panel.classList.add("is-dragging");
       e.preventDefault();
+      e.stopPropagation();
     };
     const onMove = (e) => {
       if (!dragging) return;
       const dx = e.clientX - startX;
       const dy = e.clientY - startY;
-      let left = Math.max(4, Math.min(window.innerWidth - 40, origL + dx));
-      let top = Math.max(4, Math.min(window.innerHeight - 40, origT + dy));
+      const w = panel.offsetWidth || 200;
+      const h = panel.offsetHeight || 40;
+      // Keep enough of the panel on-screen to grab the move control again
+      const minVisible = 48;
+      let left = Math.max(4 - (w - minVisible), Math.min(window.innerWidth - minVisible, origL + dx));
+      let top = Math.max(4, Math.min(window.innerHeight - Math.min(h, 40), origT + dy));
       panel.style.left = left + "px";
       panel.style.top = top + "px";
       panel.style.right = "auto";
     };
-    const onUp = () => {
+    const onUp = (e) => {
       if (!dragging) return;
       dragging = false;
+      try { handle.releasePointerCapture?.(e.pointerId); } catch { /* ignore */ }
       panel.classList.remove("is-dragging");
       const rect = panel.getBoundingClientRect();
       savePanelPos({ top: Math.round(rect.top), left: Math.round(rect.left) });
@@ -1673,6 +1680,7 @@
     handle.addEventListener("pointerdown", onDown);
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
   }
 
   async function injectShadowStyles(shadow) {
@@ -1691,7 +1699,36 @@
 #__de_en_host_root { all: initial; }
 #__de_en_panel {
   z-index: 2147483000 !important;
-  max-width: 240px;
+  min-width: 200px;
+  max-width: min(240px, calc(100vw - 16px));
+  width: max-content;
+}
+#__de_en_panel.is-minimized {
+  min-width: 0;
+  max-width: none;
+  width: auto;
+  flex-direction: row !important;
+  align-items: center;
+  gap: 4px;
+}
+#__de_en_panel.is-minimized #__de_en_panel_body,
+#__de_en_panel.is-minimized #__de_en_privacy {
+  display: none !important;
+}
+#__de_en_panel.is-minimized #__de_en_header {
+  display: flex !important;
+  width: auto;
+  flex-shrink: 0;
+}
+#__de_en_panel.is-minimized #__de_en_title,
+#__de_en_panel.is-minimized #__de_en_min_btn {
+  display: none !important;
+}
+#__de_en_panel.is-minimized #__de_en_header_actions {
+  display: inline-flex !important;
+}
+#__de_en_panel.is-minimized #__de_en_drag {
+  display: inline-flex !important;
 }
 #__de_en_panel.theme-light {
   background: rgba(255,255,255,.88) !important;
@@ -1710,16 +1747,59 @@
   border-color: rgba(0,0,0,.08) !important;
 }
 #__de_en_panel.is-dragging { opacity: .92; cursor: grabbing; }
-#__de_en_drag {
+#__de_en_header_actions {
   all: initial;
+  display: inline-flex !important;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+#__de_en_drag,
+#__de_en_min_btn,
+#__de_en_pill_drag {
+  all: initial;
+  box-sizing: border-box;
+  width: 26px;
+  height: 26px;
+  min-width: 26px;
+  min-height: 26px;
+  border-radius: 6px;
+  display: inline-flex !important;
+  align-items: center;
+  justify-content: center;
   cursor: grab;
-  font-size: 12px;
-  color: rgba(255,255,255,.45);
-  padding: 0 4px;
-  font-family: sans-serif;
+  color: rgba(255,255,255,.9);
+  background: rgba(255,255,255,.12);
+  font-size: 14px;
+  font-weight: 700;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  line-height: 1;
+  flex-shrink: 0;
+  border: 1px solid rgba(255,255,255,.1);
+  touch-action: none;
   user-select: none;
 }
-#__de_en_panel.theme-light #__de_en_drag { color: rgba(0,0,0,.35); }
+#__de_en_min_btn { cursor: pointer; font-size: 14px; }
+#__de_en_drag:active,
+#__de_en_pill_drag:active { cursor: grabbing; background: rgba(255,255,255,.22); }
+#__de_en_drag:hover,
+#__de_en_min_btn:hover,
+#__de_en_pill_drag:hover { background: rgba(255,255,255,.2); }
+#__de_en_panel.theme-light #__de_en_drag,
+#__de_en_panel.theme-light #__de_en_min_btn,
+#__de_en_panel.theme-light #__de_en_pill_drag {
+  color: rgba(0,0,0,.75);
+  background: rgba(0,0,0,.08);
+  border-color: rgba(0,0,0,.1);
+}
+#__de_en_site_auto_row, #__de_en_lang_row, #__de_en_theme_row, #__de_en_auto_row {
+  width: 100%;
+  box-sizing: border-box;
+  min-width: 0;
+}
+#__de_en_site_auto_switch, #__de_en_auto_switch, #__de_en_lang_select, #__de_en_theme_select {
+  flex-shrink: 0;
+}
 #__de_en_progress {
   all: initial;
   display: block;
@@ -1792,6 +1872,7 @@
 #__de_en_unhide[hidden] { display: none !important; }
 #__de_en_panel.is-site-hidden #__de_en_header,
 #__de_en_panel.is-site-hidden #__de_en_panel_body,
+#__de_en_panel.is-site-hidden #__de_en_pill_row,
 #__de_en_panel.is-site-hidden #__de_en_pill { display: none !important; }
 #__de_en_site_auto_switch {
   all: initial; position: relative !important; display: block !important;
@@ -1847,6 +1928,8 @@
 #__de_en_auto_switch:focus-visible,
 #__de_en_site_auto_switch:focus-visible,
 #__de_en_min_btn:focus-visible,
+#__de_en_drag:focus-visible,
+#__de_en_pill_drag:focus-visible,
 #__de_en_pill:focus-visible,
 #__de_en_pill_toggle:focus-visible,
 #__de_en_hide_site:focus-visible,
@@ -1856,13 +1939,25 @@
   outline-offset: 2px !important;
 }
 #__de_en_pill_toggle {
-  all: initial; display: none; margin-left: 6px; cursor: pointer; padding: 2px 6px;
+  all: initial; display: none !important; margin-left: 0; cursor: pointer; padding: 4px 8px;
   border-radius: 6px; font-size: 10px; font-weight: 700; color: #fff;
   background: #0a6cff; font-family: sans-serif;
 }
-#__de_en_panel.is-minimized #__de_en_pill_row { display: flex !important; align-items: center; gap: 4px; }
-#__de_en_pill_row { all: initial; display: none; }
+#__de_en_pill_row {
+  all: initial;
+  display: none !important;
+  align-items: center;
+  gap: 4px;
+}
+#__de_en_panel.is-minimized #__de_en_pill_row {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 4px;
+}
 #__de_en_panel.is-minimized #__de_en_pill { display: inline-flex !important; }
+#__de_en_panel.is-minimized #__de_en_pill_toggle { display: inline-flex !important; align-items: center; }
+/* Same move control as expanded — no separate mini drag needed */
+#__de_en_pill_drag { display: none !important; }
 @media (prefers-reduced-motion: reduce) {
   #__de_en_progress::after { transition: none !important; }
 }
@@ -1916,10 +2011,12 @@
 
     const header = document.createElement("div");
     header.id = "__de_en_header";
-    dragHandleEl = document.createElement("span");
+    dragHandleEl = document.createElement("button");
+    dragHandleEl.type = "button";
     dragHandleEl.id = "__de_en_drag";
     dragHandleEl.textContent = "⠿";
-    dragHandleEl.title = "Drag panel";
+    dragHandleEl.title = "Move panel";
+    dragHandleEl.setAttribute("aria-label", "Move translator panel");
     const title = document.createElement("span");
     title.id = "__de_en_title";
     title.textContent = "DE → EN";
@@ -1928,6 +2025,7 @@
     minBtnEl.id = "__de_en_min_btn";
     minBtnEl.textContent = "–";
     minBtnEl.setAttribute("aria-label", "Minimize translator panel");
+    minBtnEl.title = "Minimize";
     minBtnEl.addEventListener("click", async (e) => {
       e.stopPropagation();
       await setMinimized(!panelMinimized);
@@ -1940,10 +2038,13 @@
         fabEl.focus();
       }
     });
-    header.append(dragHandleEl, title, minBtnEl);
+    const headerActions = document.createElement("div");
+    headerActions.id = "__de_en_header_actions";
+    headerActions.append(dragHandleEl, minBtnEl);
+    header.append(title, headerActions);
     setupDrag(dragHandleEl, panelEl);
 
-    // I3: minimized row with explicit Translate button (no dblclick required)
+    // I3: minimized row — Expand + Translate; Move stays on header (always visible)
     const pillRow = document.createElement("div");
     pillRow.id = "__de_en_pill_row";
     const pill = document.createElement("button");
