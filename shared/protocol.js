@@ -19,8 +19,14 @@
     CHECK_SENSITIVE: "DE_EN_CHECK_SENSITIVE",
     SHOW_PANEL: "DE_EN_SHOW_PANEL",
     TOOLBAR_FAIL: "DE_EN_TOOLBAR_FAIL",
-    /** Fully disable the extension; user re-enables at chrome://extensions */
-    DISABLE_SELF: "DE_EN_DISABLE_SELF",
+    /**
+     * Soft power-off (storage). Extension stays installed; toolbar icon turns it back on.
+     * Legacy name DISABLE_SELF kept for one release.
+     */
+    POWER_OFF: "DE_EN_POWER_OFF",
+    DISABLE_SELF: "DE_EN_POWER_OFF",
+    /** Soft power-on (usually via toolbar); content re-shows UI */
+    POWER_ON: "DE_EN_POWER_ON",
   });
 
   /**

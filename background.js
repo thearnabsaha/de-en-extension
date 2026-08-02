@@ -291,42 +291,99 @@ async function ensureContentScript(tabId) {
   return false;
 }
 
-function setActionBadge(tabId, { translated, auto, error, sensitive, errorDetail }) {
+const StorageKeys = (self.DeEn && self.DeEn.StorageKeys) || {
+  ENABLED: "deEnEnabled",
+};
+
+/** Master power: default ON when key is missing. */
+async function isMasterEnabled() {
   try {
-    if (error) {
-      chrome.action.setBadgeText({ tabId, text: "!" });
-      chrome.action.setBadgeBackgroundColor({ tabId, color: "#d93025" });
+    const stored = await chrome.storage.local.get(StorageKeys.ENABLED);
+    return stored[StorageKeys.ENABLED] !== false;
+  } catch {
+    return true;
+  }
+}
+
+async function setMasterEnabled(on) {
+  await chrome.storage.local.set({ [StorageKeys.ENABLED]: !!on });
+  applyMasterPowerBadge(!!on);
+}
+
+/** Global toolbar badge while soft-off (not tab-scoped). */
+function applyMasterPowerBadge(on) {
+  try {
+    if (!on) {
+      chrome.action.setBadgeText({ text: "OFF" });
+      chrome.action.setBadgeBackgroundColor({ color: "#5f6368" });
       chrome.action.setTitle({
-        tabId,
-        title: "DE → EN: " + (errorDetail || "translation error"),
+        title: "DE → EN is off — click this icon to turn it back on",
       });
-      return;
-    }
-    if (translated) {
-      chrome.action.setBadgeText({ tabId, text: "EN" });
-      chrome.action.setBadgeBackgroundColor({ tabId, color: "#0a6cff" });
-      chrome.action.setTitle({
-        tabId,
-        title: "DE → EN: showing English (click to restore German)",
-      });
-    } else if (sensitive) {
-      chrome.action.setBadgeText({ tabId, text: "P" });
-      chrome.action.setBadgeBackgroundColor({ tabId, color: "#f9ab00" });
-      chrome.action.setTitle({
-        tabId,
-        title: "DE → EN: sensitive site — auto-translate disabled",
-      });
-    } else if (auto) {
-      chrome.action.setBadgeText({ tabId, text: "A" });
-      chrome.action.setBadgeBackgroundColor({ tabId, color: "#34c759" });
-      chrome.action.setTitle({ tabId, title: "DE → EN: auto-translate ON" });
     } else {
-      chrome.action.setBadgeText({ tabId, text: "" });
+      chrome.action.setBadgeText({ text: "" });
       chrome.action.setTitle({
-        tabId,
         title: "Translate page: German → English (Alt+Shift+B)",
       });
     }
+  } catch {
+    /* ignore */
+  }
+}
+
+// Restore OFF badge after SW wake
+isMasterEnabled().then((on) => applyMasterPowerBadge(on)).catch(() => {});
+
+function setActionBadge(tabId, { translated, auto, error, sensitive, errorDetail }) {
+  try {
+    // Don't overwrite global OFF badge while powered down
+    chrome.storage.local.get(StorageKeys.ENABLED, (stored) => {
+      try {
+        if (stored && stored[StorageKeys.ENABLED] === false) {
+          chrome.action.setBadgeText({ text: "OFF" });
+          chrome.action.setBadgeBackgroundColor({ color: "#5f6368" });
+          chrome.action.setTitle({
+            title: "DE → EN is off — click this icon to turn it back on",
+          });
+          return;
+        }
+        if (error) {
+          chrome.action.setBadgeText({ tabId, text: "!" });
+          chrome.action.setBadgeBackgroundColor({ tabId, color: "#d93025" });
+          chrome.action.setTitle({
+            tabId,
+            title: "DE → EN: " + (errorDetail || "translation error"),
+          });
+          return;
+        }
+        if (translated) {
+          chrome.action.setBadgeText({ tabId, text: "EN" });
+          chrome.action.setBadgeBackgroundColor({ tabId, color: "#0a6cff" });
+          chrome.action.setTitle({
+            tabId,
+            title: "DE → EN: showing English (click to restore German)",
+          });
+        } else if (sensitive) {
+          chrome.action.setBadgeText({ tabId, text: "P" });
+          chrome.action.setBadgeBackgroundColor({ tabId, color: "#f9ab00" });
+          chrome.action.setTitle({
+            tabId,
+            title: "DE → EN: sensitive site — auto-translate disabled",
+          });
+        } else if (auto) {
+          chrome.action.setBadgeText({ tabId, text: "A" });
+          chrome.action.setBadgeBackgroundColor({ tabId, color: "#34c759" });
+          chrome.action.setTitle({ tabId, title: "DE → EN: auto-translate ON" });
+        } else {
+          chrome.action.setBadgeText({ tabId, text: "" });
+          chrome.action.setTitle({
+            tabId,
+            title: "Translate page: German → English (Alt+Shift+B)",
+          });
+        }
+      } catch {
+        /* tab gone */
+      }
+    });
   } catch {
     /* tab gone */
   }
@@ -372,6 +429,39 @@ async function broadcastToggle(tabId) {
   );
 }
 
+async function broadcastPowerOn(tabId) {
+  let frameIds = [0];
+  try {
+    if (chrome.webNavigation && chrome.webNavigation.getAllFrames) {
+      const frames = await chrome.webNavigation.getAllFrames({ tabId });
+      if (frames && frames.length) frameIds = frames.map((f) => f.frameId);
+    }
+  } catch {
+    /* main frame only */
+  }
+  await Promise.all(
+    frameIds.map((frameId) =>
+      chrome.tabs
+        .sendMessage(
+          tabId,
+          { type: Msg.POWER_ON || "DE_EN_POWER_ON", v: 1 },
+          { frameId }
+        )
+        .catch(() => {})
+    )
+  );
+  // Also expand panel on top frame
+  try {
+    await chrome.tabs.sendMessage(
+      tabId,
+      { type: Msg.SHOW_PANEL || "DE_EN_SHOW_PANEL", v: 1 },
+      { frameId: 0 }
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
 async function toggleActiveTab(tab) {
   if (!tab || !tab.id) return;
 
@@ -388,6 +478,21 @@ async function toggleActiveTab(tab) {
       tab.id,
       "Cannot run on this page (browser-restricted URL)"
     );
+    return;
+  }
+
+  // Soft-off: toolbar icon turns the extension back on (no chrome://extensions)
+  if (!(await isMasterEnabled())) {
+    await setMasterEnabled(true);
+    const ok = await ensureContentScript(tab.id);
+    if (!ok) {
+      await reportToolbarFailure(
+        tab.id,
+        "Turned on — refresh this page to show the panel"
+      );
+      return;
+    }
+    await broadcastPowerOn(tab.id);
     return;
   }
 
@@ -411,6 +516,7 @@ if (chrome.commands && chrome.commands.onCommand) {
   chrome.commands.onCommand.addListener(async (command) => {
     if (command !== "toggle-translate") return;
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    // Shortcut also re-enables when soft-off
     await toggleActiveTab(tab);
   });
 }
@@ -501,25 +607,31 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
 
-  // Fully turn off the extension (user must re-enable at chrome://extensions)
-  if (t === (Msg.DISABLE_SELF || "DE_EN_DISABLE_SELF")) {
-    const id = chrome.runtime.id;
-    chrome.management.setEnabled(id, false, () => {
-      const err = chrome.runtime.lastError;
-      if (err) {
-        try {
-          sendResponse({ ok: false, error: err.message || String(err) });
-        } catch {
-          /* channel may already be closed as we disable */
-        }
-        return;
-      }
-      try {
-        sendResponse({ ok: true });
-      } catch {
-        /* ignore — extension is shutting down */
-      }
-    });
+  // Soft power-off — stays installed; toolbar icon turns it back on
+  if (
+    t === (Msg.POWER_OFF || "DE_EN_POWER_OFF") ||
+    t === "DE_EN_DISABLE_SELF"
+  ) {
+    setMasterEnabled(false)
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) =>
+        sendResponse({
+          ok: false,
+          error: String(err && err.message ? err.message : err),
+        })
+      );
+    return true;
+  }
+
+  if (t === (Msg.POWER_ON || "DE_EN_POWER_ON")) {
+    setMasterEnabled(true)
+      .then(() => sendResponse({ ok: true }))
+      .catch((err) =>
+        sendResponse({
+          ok: false,
+          error: String(err && err.message ? err.message : err),
+        })
+      );
     return true;
   }
 

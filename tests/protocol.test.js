@@ -12,7 +12,9 @@ describe("protocol", () => {
     assert.equal(typeof DeEn.PROTOCOL_VERSION, "number");
     assert.equal(DeEn.Msg.TRANSLATE, "DE_EN_TRANSLATE");
     assert.equal(DeEn.Msg.TOGGLE, "DE_EN_TOGGLE");
-    assert.equal(DeEn.Msg.DISABLE_SELF, "DE_EN_DISABLE_SELF");
+    assert.equal(DeEn.Msg.POWER_OFF, "DE_EN_POWER_OFF");
+    assert.equal(DeEn.Msg.POWER_ON, "DE_EN_POWER_ON");
+    assert.equal(DeEn.Msg.DISABLE_SELF, "DE_EN_POWER_OFF");
   });
 
   it("msg() wraps type and version", () => {

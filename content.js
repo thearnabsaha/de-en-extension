@@ -133,6 +133,9 @@
   let lastErrorDetail = "";
   let privacyAccepted = false;
   let sensitiveSite = false;
+  /** Master power — false = soft-off (toolbar icon turns back on) */
+  let extensionEnabled = true;
+  let globalKeyBound = false;
   /** I10: 'auto' | 'dark' | 'light' */
   let themeMode = "auto";
   /** I1: { top, right } or null */
@@ -501,9 +504,12 @@
     sensitiveSite = isSensitiveHost(host);
     try {
       const stored = await chrome.storage.local.get([
+        StorageKeys.ENABLED,
         StorageKeys.AUTO_MODE, StorageKeys.SITE_PREFS, StorageKeys.HIDDEN_HOSTS,
         StorageKeys.PRIVACY_ACCEPTED, StorageKeys.THEME,
       ]);
+      // Default ON when key missing
+      extensionEnabled = stored[StorageKeys.ENABLED] !== false;
       globalAutoMode = !!stored[StorageKeys.AUTO_MODE];
       privacyAccepted = !!stored[StorageKeys.PRIVACY_ACCEPTED];
       themeMode = stored[StorageKeys.THEME] === "light" || stored[StorageKeys.THEME] === "dark"
@@ -523,6 +529,7 @@
       autoMode = computeEffectiveAuto();
       langDetectCache = null;
     } catch {
+      extensionEnabled = true;
       globalAutoMode = false;
       autoMode = false;
       panelMinimized = false;
@@ -605,6 +612,22 @@
     if (area !== "local") return;
     const host = hostname();
     let need = false;
+
+    if (changes[StorageKeys.ENABLED]) {
+      const next = changes[StorageKeys.ENABLED].newValue !== false;
+      if (next !== extensionEnabled) {
+        extensionEnabled = next;
+        if (extensionEnabled) {
+          powerOnUi().catch(() => {});
+        } else {
+          powerOffUi().catch(() => {});
+        }
+      }
+      return;
+    }
+
+    if (!extensionEnabled) return;
+
     if (changes[StorageKeys.AUTO_MODE]) {
       globalAutoMode = !!changes[StorageKeys.AUTO_MODE].newValue;
       autoMode = computeEffectiveAuto();
@@ -1438,6 +1461,7 @@
   }
 
   async function runToggleLocal() {
+    if (!extensionEnabled) return;
     if (phase === "translating") {
       showBadge("Cancelling…");
       await restorePage();
@@ -1449,6 +1473,7 @@
   }
 
   async function runToggle() {
+    if (!extensionEnabled) return;
     if (IS_TOP) {
       try {
         await new Promise((resolve) => {
@@ -1663,19 +1688,45 @@
     }
   }
 
-  /**
-   * Fully disable the extension. User must re-enable at chrome://extensions.
-   * No confirm — best-effort restores the page and tears down the panel.
-   */
-  async function turnOffExtension() {
-    if (!IS_TOP) return;
+  /** Remove UI only — keep listeners so toolbar can turn us back on. */
+  function tearDownUi() {
+    try {
+      stopObserver();
+      if (retranslateTimer) {
+        clearTimeout(retranslateTimer);
+        retranslateTimer = null;
+      }
+      if (mutateTimer) {
+        clearTimeout(mutateTimer);
+        mutateTimer = null;
+      }
+      if (hostEl) hostEl.remove();
+    } catch {
+      /* ignore */
+    }
+    hostEl = null;
+    shadowRoot = null;
+    panelEl = null;
+    fabEl = null;
+    autoSwitchEl = null;
+    siteAutoSwitchEl = null;
+    minBtnEl = null;
+    hideBtnEl = null;
+    unhideBtnEl = null;
+    privacyEl = null;
+    progressEl = null;
+    statusLineEl = null;
+    langSelectEl = null;
+    themeSelectEl = null;
+    dragHandleEl = null;
+  }
 
-    showBadge("Turning off extension…", 4000);
-
-    // Best-effort restore so the page is not left mid-translation
+  async function powerOffUi() {
+    extensionEnabled = false;
+    runGeneration++;
+    phase = "idle";
     try {
       if (translated) {
-        runGeneration++;
         phase = "restoring";
         try {
           await restorePage();
@@ -1687,28 +1738,48 @@
     } catch {
       /* ignore */
     }
+    tearDownUi();
+  }
+
+  async function powerOnUi() {
+    extensionEnabled = true;
+    if (!IS_TOP) return;
+    await createPanel();
+    syncPanelControls();
+    applyPanelVisibility();
+    applyPanelPosition();
+    applyTheme();
+    pushActionState();
+    showBadge("Extension on — click icon anytime to translate", 3500);
+  }
+
+  /**
+   * Soft power-off: hide UI and stop work. Re-enable via toolbar icon
+   * (extensions menu / pin bar) — not chrome://extensions.
+   */
+  async function turnOffExtension() {
+    if (!IS_TOP) return;
+    if (!extensionEnabled) return;
+
+    showBadge("Turning off… Click the extension icon to turn back on", 5000);
 
     try {
-      if (typeof window.__deEnCleanup === "function") window.__deEnCleanup();
-    } catch {
-      /* ignore */
-    }
-
-    try {
-      const res = await chrome.runtime.sendMessage(
-        makeMsg(Msg.DISABLE_SELF || "DE_EN_DISABLE_SELF")
+      await chrome.runtime.sendMessage(
+        makeMsg(Msg.POWER_OFF || Msg.DISABLE_SELF || "DE_EN_POWER_OFF")
       );
-      // If disable worked, the SW is gone and we may never get a clean response.
-      if (res && res.ok === false) {
-        showBadge(res.error || "Could not turn off extension", 6000);
-      }
     } catch (err) {
-      // Expected once the extension is disabled mid-call
-      const msg = err && err.message ? String(err.message) : String(err);
-      if (!/Extension context invalidated|message port closed|Receiving end does not exist/i.test(msg)) {
-        showBadge(msg || "Could not turn off extension", 6000);
+      // Fall back to writing storage directly if SW is busy
+      try {
+        await chrome.storage.local.set({ [StorageKeys.ENABLED]: false });
+      } catch {
+        const msg = err && err.message ? String(err.message) : String(err);
+        showBadge(msg || "Could not turn off", 6000);
+        return;
       }
     }
+
+    // Storage listener also tears down; do it immediately for snappy UX
+    await powerOffUi();
   }
 
   function syncPanelControls() {
@@ -2348,8 +2419,8 @@
     pillClose.type = "button";
     pillClose.id = "__de_en_pill_close";
     pillClose.textContent = "×";
-    pillClose.title = "Turn off extension";
-    pillClose.setAttribute("aria-label", "Turn off the DE to EN extension completely");
+    pillClose.title = "Turn off extension (toolbar icon turns it back on)";
+    pillClose.setAttribute("aria-label", "Turn off the DE to EN extension. Use the toolbar icon to turn it back on.");
     pillClose.addEventListener("click", (e) => {
       e.stopPropagation();
       turnOffExtension();
@@ -2492,8 +2563,8 @@
     powerOffBtn.type = "button";
     powerOffBtn.id = "__de_en_power_off";
     powerOffBtn.textContent = "Turn off extension";
-    powerOffBtn.title = "Disable DE → EN completely. Re-enable from chrome://extensions.";
-    powerOffBtn.setAttribute("aria-label", "Turn off the DE to EN extension completely");
+    powerOffBtn.title = "Turn off DE → EN. Click the extension icon in the toolbar to turn it back on.";
+    powerOffBtn.setAttribute("aria-label", "Turn off the DE to EN extension. Use the toolbar icon to turn it back on.");
     powerOffBtn.addEventListener("click", (e) => {
       e.stopPropagation();
       turnOffExtension();
@@ -2515,13 +2586,17 @@
       }
     });
 
-    // I: keyboard shortcut Alt+Shift+B
-    window.addEventListener("keydown", onGlobalKey, true);
+    // I: keyboard shortcut Alt+Shift+B (once)
+    if (!globalKeyBound) {
+      window.addEventListener("keydown", onGlobalKey, true);
+      globalKeyBound = true;
+    }
   }
 
   function onGlobalKey(e) {
     if (!(e.altKey && e.shiftKey && (e.key === "B" || e.key === "b"))) return;
     if (!IS_TOP) return;
+    if (!extensionEnabled) return;
     e.preventDefault();
     runToggle();
   }
@@ -2533,18 +2608,55 @@
       return false;
     }
     if (msg.type === (Msg.PING || "DE_EN_PING")) {
-      sendResponse({ ok: true, translated, autoMode, phase, sensitive: sensitiveSite });
+      sendResponse({
+        ok: true,
+        translated,
+        autoMode,
+        phase,
+        sensitive: sensitiveSite,
+        enabled: extensionEnabled,
+      });
       return false;
     }
+    if (msg.type === (Msg.POWER_ON || "DE_EN_POWER_ON")) {
+      extensionEnabled = true;
+      powerOnUi()
+        .then(() => sendResponse({ ok: true, enabled: true }))
+        .catch(() => sendResponse({ ok: true, enabled: true }));
+      return true;
+    }
+    if (msg.type === (Msg.POWER_OFF || "DE_EN_POWER_OFF") || msg.type === "DE_EN_DISABLE_SELF") {
+      powerOffUi()
+        .then(() => sendResponse({ ok: true, enabled: false }))
+        .catch(() => sendResponse({ ok: true, enabled: false }));
+      return true;
+    }
     if (msg.type === (Msg.TOGGLE || "DE_EN_TOGGLE")) {
+      if (!extensionEnabled) {
+        // Treat toolbar toggle while off as power-on (belt-and-suspenders with SW)
+        extensionEnabled = true;
+        powerOnUi()
+          .then(() => sendResponse({ ok: true, translated, phase, enabled: true }))
+          .catch(() => sendResponse({ ok: true, enabled: true }));
+        return true;
+      }
       runToggleLocal().then(() => sendResponse({ ok: true, translated, phase }));
       return true;
     }
     if (msg.type === (Msg.SHOW_PANEL || "DE_EN_SHOW_PANEL")) {
       if (IS_TOP) {
-        setHiddenOnThisSite(false).then(() => setMinimized(false).then(() => {
-          applyPanelVisibility(); syncPanelControls();
-        }));
+        const go = async () => {
+          if (!extensionEnabled) {
+            extensionEnabled = true;
+            await powerOnUi();
+          }
+          await setHiddenOnThisSite(false);
+          await setMinimized(false);
+          applyPanelVisibility();
+          syncPanelControls();
+        };
+        go().then(() => sendResponse({ ok: true })).catch(() => sendResponse({ ok: true }));
+        return true;
       }
       sendResponse({ ok: true });
       return false;
@@ -2602,14 +2714,21 @@
       chrome.runtime.onMessage.removeListener(onRuntimeMessage);
       try { chrome.storage.onChanged.removeListener(onStorageChanged); } catch { /* ignore */ }
       try { window.removeEventListener("keydown", onGlobalKey, true); } catch { /* ignore */ }
-      if (hostEl) hostEl.remove();
-      hostEl = null; shadowRoot = null; panelEl = null;
+      globalKeyBound = false;
+      tearDownUi();
     } catch { /* ignore */ }
   };
 
   async function init() {
-    if (IS_TOP) await createPanel();
     await loadPrefs();
+
+    // Soft-off: stay quiet but keep listeners so toolbar can power back on
+    if (!extensionEnabled) {
+      pushActionState({ poweredOff: true });
+      return;
+    }
+
+    if (IS_TOP) await createPanel();
     const det = detectPageLanguage(true);
 
     try {

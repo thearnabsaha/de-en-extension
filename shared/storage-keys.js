@@ -5,6 +5,12 @@
   const DeEn = g.DeEn || (g.DeEn = {});
 
   DeEn.StorageKeys = Object.freeze({
+    /**
+     * Master on/off. When false, no panel / auto-translate; toolbar icon turns it back on.
+     * Default true when missing.
+     * @type {boolean}
+     */
+    ENABLED: "deEnEnabled",
     /** @type {boolean} global auto-translate */
     AUTO_MODE: "deEnAutoMode",
     /** @type {boolean} user accepted privacy notice */
