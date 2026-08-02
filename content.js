@@ -1753,6 +1753,7 @@
       if (
         id === "__de_en_pill" ||
         id === "__de_en_pill_toggle" ||
+        id === "__de_en_pill_close" ||
         id === "__de_en_min_btn" ||
         id === "__de_en_fab" ||
         id === "__de_en_auto_switch" ||
@@ -2156,6 +2157,7 @@
 #__de_en_pill_drag:focus-visible,
 #__de_en_pill:focus-visible,
 #__de_en_pill_toggle:focus-visible,
+#__de_en_pill_close:focus-visible,
 #__de_en_hide_site:focus-visible,
 #__de_en_power_off:focus-visible,
 #__de_en_lang_select:focus-visible,
@@ -2181,6 +2183,40 @@
 }
 #__de_en_panel.is-minimized #__de_en_pill { display: inline-flex !important; }
 #__de_en_panel.is-minimized #__de_en_pill_toggle { display: inline-flex !important; align-items: center; }
+#__de_en_pill_close {
+  all: initial;
+  display: none !important;
+  box-sizing: border-box;
+  width: 22px;
+  height: 22px;
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
+  color: #ffb4b0;
+  background: rgba(220, 50, 50, 0.22);
+  border: 1px solid rgba(255, 120, 110, 0.4);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+#__de_en_panel.is-minimized #__de_en_pill_close {
+  display: inline-flex !important;
+}
+#__de_en_pill_close:hover {
+  color: #fff;
+  background: rgba(220, 50, 50, 0.45);
+}
+#__de_en_panel.theme-light #__de_en_pill_close {
+  color: #b00020;
+  background: rgba(200, 40, 40, 0.14);
+  border-color: rgba(180, 40, 40, 0.35);
+}
 /* Same move control as expanded — no separate mini drag needed */
 #__de_en_pill_drag { display: none !important; }
 @media (prefers-reduced-motion: reduce) {
@@ -2308,7 +2344,17 @@
       e.stopPropagation();
       runToggle();
     });
-    pillRow.append(pill, pillToggle);
+    const pillClose = document.createElement("button");
+    pillClose.type = "button";
+    pillClose.id = "__de_en_pill_close";
+    pillClose.textContent = "×";
+    pillClose.title = "Turn off extension";
+    pillClose.setAttribute("aria-label", "Turn off the DE to EN extension completely");
+    pillClose.addEventListener("click", (e) => {
+      e.stopPropagation();
+      turnOffExtension();
+    });
+    pillRow.append(pill, pillToggle, pillClose);
 
     const body = document.createElement("div");
     body.id = "__de_en_panel_body";
