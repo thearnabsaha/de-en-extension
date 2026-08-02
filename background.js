@@ -501,5 +501,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
 
+  // Fully turn off the extension (user must re-enable at chrome://extensions)
+  if (t === (Msg.DISABLE_SELF || "DE_EN_DISABLE_SELF")) {
+    const id = chrome.runtime.id;
+    chrome.management.setEnabled(id, false, () => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        try {
+          sendResponse({ ok: false, error: err.message || String(err) });
+        } catch {
+          /* channel may already be closed as we disable */
+        }
+        return;
+      }
+      try {
+        sendResponse({ ok: true });
+      } catch {
+        /* ignore — extension is shutting down */
+      }
+    });
+    return true;
+  }
+
   return false;
 });

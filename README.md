@@ -23,6 +23,7 @@ Toggle-translate any webpage from **German to English**, in place. Free — no A
 | **Theme** | Auto / Dark / Light. |
 | **Drag handle (⠿)** | Reposition panel (saved per site). |
 | **Hide / Show** | Hide panel; **DE/EN** chip re-shows it. |
+| **Turn off extension** | Fully disables the extension (re-enable at `chrome://extensions`). |
 | **Privacy notice** | Required once before any network translate. |
 | **Toolbar badge** | `EN` translated · `A` auto · `P` sensitive · `!` error · `×` cannot inject |
 

@@ -1663,6 +1663,60 @@
     }
   }
 
+  /**
+   * Fully disable the extension. User must re-enable at chrome://extensions.
+   * Confirms first; best-effort restores the page and tears down the panel.
+   */
+  async function turnOffExtension() {
+    if (!IS_TOP) return;
+    const ok = window.confirm(
+      "Turn off DE → EN Page Translator completely?\n\n" +
+        "The extension will stop on all sites.\n" +
+        "To use it again, open chrome://extensions and turn it back on."
+    );
+    if (!ok) return;
+
+    showBadge("Turning off extension…", 4000);
+
+    // Best-effort restore so the page is not left mid-translation
+    try {
+      if (translated) {
+        runGeneration++;
+        phase = "restoring";
+        try {
+          await restorePage();
+        } catch {
+          /* ignore */
+        }
+        phase = "idle";
+      }
+    } catch {
+      /* ignore */
+    }
+
+    try {
+      if (typeof window.__deEnCleanup === "function") window.__deEnCleanup();
+    } catch {
+      /* ignore */
+    }
+
+    try {
+      const res = await chrome.runtime.sendMessage(
+        makeMsg(Msg.DISABLE_SELF || "DE_EN_DISABLE_SELF")
+      );
+      // If disable worked, the SW is gone and we may never get a clean response.
+      if (res && res.ok === false) {
+        showBadge(res.error || "Could not turn off extension", 6000);
+      }
+    } catch (err) {
+      // Expected once the extension is disabled mid-call
+      const msg = err && err.message ? String(err.message) : String(err);
+      if (!/Extension context invalidated|message port closed|Receiving end does not exist/i.test(msg)) {
+        showBadge(msg || "Could not turn off extension", 6000);
+      }
+    }
+  }
+
   function syncPanelControls() {
     if (autoSwitchEl) {
       autoSwitchEl.classList.toggle("is-on", globalAutoMode);
@@ -1710,6 +1764,7 @@
         id === "__de_en_auto_switch" ||
         id === "__de_en_site_auto_switch" ||
         id === "__de_en_hide_site" ||
+        id === "__de_en_power_off" ||
         id === "__de_en_lang_select" ||
         id === "__de_en_theme_select" ||
         id === "__de_en_privacy_accept"
@@ -1894,6 +1949,32 @@
   color: rgba(0,0,0,.65) !important;
   background: rgba(0,0,0,.05) !important;
   border-color: rgba(0,0,0,.08) !important;
+}
+#__de_en_power_off {
+  all: initial;
+  display: block !important;
+  width: 100%;
+  box-sizing: border-box;
+  text-align: center;
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #ffb4b0;
+  background: rgba(220, 50, 50, 0.18);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  border: 1px solid rgba(255, 120, 110, 0.35);
+  margin-top: 2px;
+}
+#__de_en_power_off:hover {
+  color: #fff;
+  background: rgba(220, 50, 50, 0.35);
+}
+#__de_en_panel.theme-light #__de_en_power_off {
+  color: #b00020 !important;
+  background: rgba(200, 40, 40, 0.12) !important;
+  border-color: rgba(180, 40, 40, 0.35) !important;
 }
 
 #__de_en_header_actions {
@@ -2082,6 +2163,7 @@
 #__de_en_pill:focus-visible,
 #__de_en_pill_toggle:focus-visible,
 #__de_en_hide_site:focus-visible,
+#__de_en_power_off:focus-visible,
 #__de_en_lang_select:focus-visible,
 #__de_en_theme_select:focus-visible {
   outline: 2px solid #3aa0ff !important;
@@ -2366,9 +2448,20 @@
       showBadge(hiddenOnSite ? "Hidden on this site" : "Panel shown on this site");
     });
 
+    const powerOffBtn = document.createElement("button");
+    powerOffBtn.type = "button";
+    powerOffBtn.id = "__de_en_power_off";
+    powerOffBtn.textContent = "Turn off extension";
+    powerOffBtn.title = "Disable DE → EN completely. Re-enable from chrome://extensions.";
+    powerOffBtn.setAttribute("aria-label", "Turn off the DE to EN extension completely");
+    powerOffBtn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      turnOffExtension();
+    });
+
     body.append(
       sensitiveNote, fabEl, progressEl, statusLineEl, divider,
-      autoRow, siteAutoRow, langRow, themeRow, hideBtnEl
+      autoRow, siteAutoRow, langRow, themeRow, hideBtnEl, powerOffBtn
     );
     panelEl.append(privacyEl, header, pillRow, body);
     root.append(unhideBtnEl, panelEl);

@@ -1,13 +1,14 @@
 {
   "manifest_version": 3,
   "name": "DE \u2192 EN Page Translator",
-  "version": "1.8.1",
+  "version": "1.8.4",
   "description": "Fast DE\u2192EN page translator: parallel batching, high concurrency, large packs.",
   "permissions": [
     "activeTab",
     "scripting",
     "storage",
-    "webNavigation"
+    "webNavigation",
+    "management"
   ],
   "host_permissions": [
     "https://translate.googleapis.com/*"

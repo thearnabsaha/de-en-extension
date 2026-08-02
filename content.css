@@ -486,6 +486,36 @@
   outline-offset: 2px;
 }
 
+/* Turn off extension completely (requires re-enable at chrome://extensions) */
+#__de_en_power_off {
+  all: initial;
+  display: block !important;
+  width: 100%;
+  box-sizing: border-box;
+  text-align: center;
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 11px;
+  font-weight: 700;
+  color: #ffb4b0;
+  background: rgba(220, 50, 50, 0.18);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  border: 1px solid rgba(255, 120, 110, 0.35);
+  margin-top: 2px;
+}
+
+#__de_en_power_off:hover {
+  color: #fff;
+  background: rgba(220, 50, 50, 0.35);
+  border-color: rgba(255, 140, 130, 0.55);
+}
+
+#__de_en_power_off:focus-visible {
+  outline: 2px solid #ff6b6b;
+  outline-offset: 2px;
+}
+
 /* ---- status badge ---- */
 #__de_en_translator_badge {
   all: initial;

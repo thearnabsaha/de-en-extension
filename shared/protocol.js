@@ -19,6 +19,8 @@
     CHECK_SENSITIVE: "DE_EN_CHECK_SENSITIVE",
     SHOW_PANEL: "DE_EN_SHOW_PANEL",
     TOOLBAR_FAIL: "DE_EN_TOOLBAR_FAIL",
+    /** Fully disable the extension; user re-enables at chrome://extensions */
+    DISABLE_SELF: "DE_EN_DISABLE_SELF",
   });
 
   /**
