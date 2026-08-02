@@ -60,6 +60,7 @@
   const Markers = DeEn.markers || null;
   const LangShared = DeEn.lang || null;
   const StorageKeys = DeEn.StorageKeys || {
+    ENABLED: "deEnEnabled",
     AUTO_MODE: "deEnAutoMode",
     PRIVACY_ACCEPTED: "deEnPrivacyAccepted",
     THEME: "deEnTheme",
