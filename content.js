@@ -1665,16 +1665,10 @@
 
   /**
    * Fully disable the extension. User must re-enable at chrome://extensions.
-   * Confirms first; best-effort restores the page and tears down the panel.
+   * No confirm — best-effort restores the page and tears down the panel.
    */
   async function turnOffExtension() {
     if (!IS_TOP) return;
-    const ok = window.confirm(
-      "Turn off DE → EN Page Translator completely?\n\n" +
-        "The extension will stop on all sites.\n" +
-        "To use it again, open chrome://extensions and turn it back on."
-    );
-    if (!ok) return;
 
     showBadge("Turning off extension…", 4000);
 
