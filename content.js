@@ -75,30 +75,29 @@
     };
 
   /**
-   * Perf v1.9.1 — viewport-first + stream applies + full parallel packs.
-   * Sequential waves were the "wait forever" bug: N waves × network RTT.
+   * Perf v1.9.2 — minimize HTTP count (few large packs), resilient markers,
+   * never explode into thousands of per-string requests on remap fail.
    */
-  const MAX_PACK_CHARS = 3600;
+  const MAX_PACK_CHARS = 4000;
   let packSeq = 0;
-  const MAX_ENCODED_HINT = 4500;
-  /** Match SW pool (~16) */
-  const CONCURRENCY = 14;
-  const MAX_ITEMS_PER_PACK = 36;
-  const MIN_RETRANSLATE_GAP_MS = 3500;
-  const OBSERVER_DEBOUNCE_MS = 1200;
-  /** Almost never yield mid-scan for typical pages */
-  const WALK_YIELD_EVERY = 12000;
-  const MAX_TRACKED_NODES = 8000;
-  const MAX_HASH_SET = 12000;
-  /** Hard caps — finish fast; user can toggle again for more */
-  const MAX_CHUNKS_PER_RUN = 80;
-  const MAX_ITEMS_PER_RUN = 2500;
-  /** Viewport pass: only this many items for instant first paint */
-  const MAX_VIEWPORT_ITEMS = 180;
-  const MAX_VIEWPORT_CHUNKS = 24;
+  const MAX_ENCODED_HINT = 4700;
+  /** Parallel packs in flight (each pack = 1 Google request) */
+  const CONCURRENCY = 18;
+  /** Pack many short strings per request → far fewer RTTs */
+  const MAX_ITEMS_PER_PACK = 64;
+  const MIN_RETRANSLATE_GAP_MS = 4000;
+  const OBSERVER_DEBOUNCE_MS = 1500;
+  const WALK_YIELD_EVERY = 20000;
+  const MAX_TRACKED_NODES = 6000;
+  const MAX_HASH_SET = 10000;
+  /** Target ~10–25 Google requests per page, not hundreds */
+  const MAX_CHUNKS_PER_RUN = 28;
+  const MAX_ITEMS_PER_RUN = 1400;
   const USE_LOCAL_TRANSLATOR = false;
   const TOP_FRAME_ONLY = true;
-  const PROGRESS_UI_MS = 200;
+  const PROGRESS_UI_MS = 250;
+  /** Text-only first pass (attrs are secondary and slow the scan) */
+  const TEXT_ONLY_FIRST_PASS = true;
 
   const DEFAULT_HIDDEN_HOSTS = [
     "chrome.google.com",
@@ -950,9 +949,9 @@
     let current = [];
     let curChars = 0;
     let curEnc = 0;
-    /** Private-use markers add ~30–50 encoded units each */
-    const MARKER_CHARS = 28;
-    const MARKER_ENC = 48;
+    /** <<<DEEN:id:n>>> markers ~20–40 encoded units */
+    const MARKER_CHARS = 24;
+    const MARKER_ENC = 40;
     const flush = () => {
       if (current.length) {
         chunks.push(current);
@@ -1197,8 +1196,36 @@
   function applyItemTranslation(item, t, gen) {
     if (!isGenCurrent(gen) || t == null || t === "") return false;
     const source = item.fullOriginal != null ? item.fullOriginal : item.value;
-    applyQueue.push({ item, t, gen, source });
-    scheduleApplyFlush();
+    // Apply immediately for snappy first paint (queue was delaying visible updates)
+    seenSourceHashes.add(hashStr(source));
+    outputHashes.add(hashStr(t));
+    applyingMutations = true;
+    try {
+      if (item.kind === "text") {
+        const node = item.node;
+        if (!node) return false;
+        if (!originalTextByNode.has(node)) trackOriginal(node, source);
+        if (node.isConnected) node.nodeValue = t;
+      } else if (item.kind === "attr") {
+        const el = item.el;
+        if (!el || !el.isConnected) return false;
+        let bag = originalAttrsByEl.get(el);
+        if (!bag) {
+          bag = {};
+          originalAttrsByEl.set(el, bag);
+        }
+        if (bag[item.attr] == null) bag[item.attr] = source;
+        setTranslatableAttr(el, item.attr, t);
+      } else {
+        return false;
+      }
+    } finally {
+      queueMicrotask(() => {
+        applyingMutations = false;
+      });
+    }
+    if (seenSourceHashes.size > MAX_HASH_SET) capSet(seenSourceHashes, MAX_HASH_SET);
+    if (outputHashes.size > MAX_HASH_SET) capSet(outputHashes, MAX_HASH_SET);
     return true;
   }
 
@@ -1312,22 +1339,7 @@
       const parts = unpackChunk(translatedFull, items.length, packId);
       items.forEach((item, i) => applyItemTranslation(item, parts[i], gen));
     } catch {
-      // Marker / network fail → parallel per-item (not sequential) with pool limit
-      if (!isGenCurrent(gen)) return;
-      await mapPool(
-        items,
-        Math.min(CONCURRENCY, 6),
-        async (item) => {
-          if (!isGenCurrent(gen)) return;
-          try {
-            const solo = await translateViaBackground(sanitizeForPack(item.value));
-            applyItemTranslation(item, solo, gen);
-          } catch {
-            /* leave original */
-          }
-        },
-        gen
-      );
+      // Do not explode into per-item requests — leave originals for this pack
     }
   }
 
@@ -1461,8 +1473,8 @@
   }
 
   /**
-   * Translate prepared jobs fully in parallel (fills SW pool).
-   * Applies as each pack returns — no waiting for later waves.
+   * Translate packs fully in parallel. One pack = one Google request.
+   * On marker fail: leave German for that pack (never N individual storms).
    */
   async function translateJobsParallel(jobs, gen, quiet, onDone) {
     let failed = 0;
@@ -1487,20 +1499,9 @@
                   applyItemTranslation(job.chunk[i], parts[i], gen);
                 }
               } catch {
-                await mapPool(
-                  job.chunk,
-                  Math.min(6, CONCURRENCY),
-                  async (item) => {
-                    if (!isGenCurrent(gen)) return;
-                    try {
-                      const solo = await translateViaBackground(sanitizeForPack(item.value));
-                      applyItemTranslation(item, solo, gen);
-                    } catch {
-                      /* leave */
-                    }
-                  },
-                  gen
-                );
+                // CRITICAL: do NOT fall back to per-string HTTP (turns 1 req into 64).
+                // Leave originals for this pack only.
+                failed++;
               }
             }
           }
@@ -1508,7 +1509,8 @@
             firstApplied = true;
             translated = true;
             setUiEnglish(true);
-            if (!quiet) showBadge("Translating…", 1800);
+            startObserver();
+            if (!quiet) showBadge("Translating…", 1500);
           }
         } catch {
           failed++;
@@ -1558,20 +1560,20 @@
         roots && roots.length
           ? roots.filter((r) => r && r.isConnected !== false)
           : [document.body || document.documentElement];
-      const isSubtree = !!(roots && roots.length);
 
-      // Single scan (text + attrs), then viewport-first parallel translate
+      // Fast scan: text-only on full-page (attrs optional later / quiet subtree keeps attrs)
+      const textOnly = TEXT_ONLY_FIRST_PASS && !(roots && roots.length);
       let textNodes = [];
       let attrTargets = [];
       for (const root of scanRoots) {
         if (!isGenCurrent(gen) || !root) continue;
         const part = await collectWorkAsync(root, gen, {
-          textOnly: false,
+          textOnly,
           viewportOnly: false,
           maxItems: MAX_ITEMS_PER_RUN,
         });
         textNodes = textNodes.concat(part.textNodes);
-        attrTargets = attrTargets.concat(part.attrTargets);
+        if (!textOnly) attrTargets = attrTargets.concat(part.attrTargets);
       }
       if (!isGenCurrent(gen)) return;
 
@@ -1580,6 +1582,17 @@
       if (items.length > MAX_ITEMS_PER_RUN) {
         items = items.slice(0, MAX_ITEMS_PER_RUN);
         itemsCapped = true;
+      }
+
+      // Viewport-first order so earliest packs in the pool are on-screen
+      {
+        const vp = [];
+        const rest = [];
+        for (const it of items) {
+          if (itemInViewport(it)) vp.push(it);
+          else rest.push(it);
+        }
+        items = vp.concat(rest);
       }
 
       if (!items.length) {
@@ -1594,59 +1607,24 @@
         return;
       }
 
-      // Split: on-screen first so user sees English in ~1 RTT
-      const vpItems = [];
-      const restItems = [];
-      if (!isSubtree) {
-        for (const it of items) {
-          if (itemInViewport(it) && vpItems.length < MAX_VIEWPORT_ITEMS) vpItems.push(it);
-          else restItems.push(it);
-        }
-      } else {
-        restItems.push(...items);
+      // Few large packs — target ~10–28 Google requests total
+      let chunks = chunkItems(items);
+      let chunksCapped = false;
+      if (chunks.length > MAX_CHUNKS_PER_RUN) {
+        chunks = chunks.slice(0, MAX_CHUNKS_PER_RUN);
+        chunksCapped = true;
       }
+      const jobs = prepareJobs(chunks);
+      const total = jobs.length;
+      let done = 0;
+      setProgress(0, total, true);
 
-      let totalFailed = 0;
-      let totalJobs = 0;
-
-      async function runItemSet(itemSet, label) {
-        if (!itemSet.length || !isGenCurrent(gen)) return;
-        let chunks = chunkItems(itemSet);
-        if (chunks.length > MAX_CHUNKS_PER_RUN) {
-          chunks = chunks.slice(0, MAX_CHUNKS_PER_RUN);
-        }
-        if (label === "vp" && chunks.length > MAX_VIEWPORT_CHUNKS) {
-          chunks = chunks.slice(0, MAX_VIEWPORT_CHUNKS);
-        }
-        const jobs = prepareJobs(chunks);
-        totalJobs += jobs.length;
-        let done = 0;
-        setProgress(0, jobs.length, true);
-        const failed = await translateJobsParallel(jobs, gen, quiet, () => {
-          done++;
-          if (isGenCurrent(gen)) bumpProgress(done, jobs.length, quiet || label === "vp");
-        });
-        totalFailed += failed;
-        flushAppliesSync();
-      }
-
-      // Pass 1 — viewport (fast perceived start)
-      if (vpItems.length) {
-        await runItemSet(vpItems, "vp");
-        if (isGenCurrent(gen) && (originalTextByNode.size || originalAttrsByEl.size)) {
-          translated = true;
-          setUiEnglish(true);
-          startObserver();
-          if (!quiet && restItems.length) {
-            showBadge("On-screen done — finishing…", 2000);
-          }
-        }
-      }
-
-      // Pass 2 — everything else in parallel
-      if (restItems.length && isGenCurrent(gen)) {
-        await runItemSet(restItems, "rest");
-      }
+      // ALL packs in flight together (viewport-ordered jobs start first)
+      const failed = await translateJobsParallel(jobs, gen, quiet, () => {
+        done++;
+        if (isGenCurrent(gen)) bumpProgress(done, total, quiet);
+      });
+      flushAppliesSync();
 
       if (!isGenCurrent(gen)) return;
       pruneDisconnected();
@@ -1654,17 +1632,17 @@
       setUiEnglish(translated);
       if (translated) startObserver();
       lastRetranslateAt = Date.now();
-      if (totalFailed > 0 && totalFailed < totalJobs) {
-        lastErrorDetail = `Partial: ${totalJobs - totalFailed}/${totalJobs} ok`;
-        if (!quiet) showBadge(lastErrorDetail);
+
+      if (failed > 0 && failed < total) {
+        lastErrorDetail = `Done (${total - failed}/${total} packs)`;
+        if (!quiet) showBadge("Translated to English");
         lastError = false;
-      } else if (totalFailed >= totalJobs && totalJobs > 0) {
-        lastErrorDetail = "All chunks failed — rate limit or network? Toggle again.";
-        if (!quiet) showBadge(lastErrorDetail, 5000);
-        lastError = true;
-      } else if (itemsCapped) {
-        lastErrorDetail = "Large page — first pass done (toggle again for more)";
+      } else if (failed >= total && total > 0) {
+        lastErrorDetail = "Translation failed — try again";
         if (!quiet) showBadge(lastErrorDetail, 4000);
+        lastError = true;
+      } else if (chunksCapped || itemsCapped) {
+        if (!quiet) showBadge("Translated (partial — toggle again for more)");
         lastError = false;
       } else {
         if (!quiet) showBadge("Translated to English");

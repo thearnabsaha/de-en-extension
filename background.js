@@ -20,20 +20,16 @@ const TRANSLATE_ENDPOINT =
 const MAX_ENCODED_Q = 4800;
 /** Reject absurd payloads (F3). */
 const MAX_PLAIN_CHARS = 20000;
-/** Larger batches = fewer content↔SW round-trips */
-const MAX_BATCH_ITEMS = 64;
+const MAX_BATCH_ITEMS = 80;
 const MAX_RETRIES = 1;
-const BASE_BACKOFF_MS = 180;
+const BASE_BACKOFF_MS = 120;
 
-/**
- * High throughput: keep the pool busy. Content streams applies as each pack lands.
- * One retry only — multi-retry was making failed pages feel endless.
- */
-const MAX_CONCURRENT_FETCHES = 16;
+/** Max parallel Google GETs — content uses fewer, larger packs. */
+const MAX_CONCURRENT_FETCHES = 20;
 const MIN_GAP_MS = 0;
-const FETCH_TIMEOUT_MS = 6000;
+const FETCH_TIMEOUT_MS = 5000;
 
-const CACHE_MAX = 8000;
+const CACHE_MAX = 10000;
 const translateCache = new Map();
 
 let activeFetches = 0;

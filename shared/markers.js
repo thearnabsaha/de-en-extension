@@ -1,11 +1,13 @@
 /**
- * Pure marker pack/unpack (L + N testable).
- * No DOM / chrome APIs.
+ * Pack/unpack multiple strings into one translate request.
+ * Uses ASCII-ish separators Google usually preserves (not private-use chars).
  */
 (function (g) {
   const DeEn = g.DeEn || (g.DeEn = {});
 
-  const MARKER_TOKEN = "\uE000DEEN\uE001";
+  // Unique, mostly-preserved delimiter. Avoid private-use (Google often strips those).
+  const OPEN = "<<<DEEN:";
+  const CLOSE = ">>>";
 
   function hashStr(s) {
     let h = 2166136261;
@@ -18,15 +20,14 @@
 
   function sanitizeForPack(text) {
     if (!text) return text;
+    // Neutralize accidental delimiter lookalikes in source
     return String(text)
-      .replace(/\uE000DEEN\uE001/g, "\uE002DEEN\uE002")
-      .replace(/\u2060⟦DEEN:\d+⟧\u2060/g, (m) => m.replace(/DEEN/g, "D·E·N"));
+      .replace(/<<<DEEN:/gi, "<<‹DEEN:")
+      .replace(/>>>/g, "»»>");
   }
 
   function makeMarker(packId, index) {
-    const body = packId + ":" + index;
-    const sum = hashStr(body).slice(0, 4);
-    return MARKER_TOKEN + body + ":" + sum + MARKER_TOKEN;
+    return OPEN + packId + ":" + index + CLOSE;
   }
 
   /**
@@ -45,6 +46,7 @@
   }
 
   /**
+   * Lenient unpack — tolerates spaces Google inserts around markers.
    * @param {string} translatedFull
    * @param {number} count
    * @param {string} packId
@@ -53,15 +55,16 @@
   function unpackValues(translatedFull, count, packId) {
     if (count === 1) return [translatedFull == null ? "" : translatedFull];
     if (!packId) throw new Error("Marker remap failed: missing pack id");
+    const src = translatedFull == null ? "" : String(translatedFull);
     const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // Allow optional spaces around marker tokens
     const re = new RegExp(
-      esc(MARKER_TOKEN) + esc(packId) + ":(\\d+):([a-z0-9]+)" + esc(MARKER_TOKEN),
-      "g"
+      "\\s*" + esc(OPEN) + "\\s*" + esc(packId) + "\\s*:\\s*(\\d+)\\s*" + esc(CLOSE) + "\\s*",
+      "gi"
     );
     const parts = [];
     let last = 0;
     let m;
-    const src = translatedFull || "";
     let expectedIdx = 0;
     while ((m = re.exec(src)) !== null) {
       parts.push(src.slice(last, m.index));
@@ -82,11 +85,11 @@
   }
 
   function newPackId(seq) {
-    return String(seq) + "x" + hashStr(String(Date.now()) + Math.random()).slice(0, 6);
+    return String(seq) + "x" + hashStr(String(Date.now()) + Math.random()).slice(0, 5);
   }
 
   DeEn.markers = {
-    MARKER_TOKEN: MARKER_TOKEN,
+    MARKER_TOKEN: OPEN,
     hashStr: hashStr,
     sanitizeForPack: sanitizeForPack,
     makeMarker: makeMarker,

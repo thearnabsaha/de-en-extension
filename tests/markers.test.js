@@ -48,10 +48,19 @@ describe("markers.packValues / unpackValues", () => {
     assert.throws(() => markers.unpackValues(broken, 3, packId), /expected 3/);
   });
 
-  it("sanitizes private-use token in source", () => {
-    const nasty = "x\uE000DEEN\uE001y";
+  it("sanitizes delimiter lookalikes in source", () => {
+    const nasty = "x<<<DEEN:0>>>y";
     const s = markers.sanitizeForPack(nasty);
-    assert.ok(!s.includes("\uE000DEEN\uE001"));
+    assert.ok(!s.includes("<<<DEEN:"));
+  });
+
+  it("unpacks when Google adds spaces around markers", () => {
+    const packId = "sp1";
+    const fake =
+      "Hello" + " <<<DEEN:" + packId + ":0>>> " + "World";
+    const parts = markers.unpackValues(fake, 2, packId);
+    assert.equal(parts[0].trim(), "Hello");
+    assert.equal(parts[1].trim(), "World");
   });
 
   it("newPackId is unique-ish", () => {

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DE \u2192 EN Page Translator",
-  "version": "1.9.1",
-  "description": "Fast DE\u2192EN: viewport-first streaming translate, parallel packs.",
+  "version": "1.9.2",
+  "description": "Fast DE\u2192EN: few large packs, resilient markers, no retry storms.",
   "permissions": [
     "activeTab",
     "scripting",
