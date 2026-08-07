@@ -20,17 +20,21 @@ const TRANSLATE_ENDPOINT =
 const MAX_ENCODED_Q = 4800;
 /** Reject absurd payloads (F3). */
 const MAX_PLAIN_CHARS = 20000;
-const MAX_BATCH_ITEMS = 120;
+/** Keep batches modest so IPC + Google stay responsive */
+const MAX_BATCH_ITEMS = 48;
 const MAX_RETRIES = 2;
-const BASE_BACKOFF_MS = 200;
+const BASE_BACKOFF_MS = 280;
 
-/** High parallelism for near-instant page translation. */
-const MAX_CONCURRENT_FETCHES = 24;
-const MIN_GAP_MS = 0;
-/** Fail fast so other requests keep moving */
-const FETCH_TIMEOUT_MS = 8000;
+/**
+ * Moderate concurrency + small gap avoids 429 storms that make translation
+ * feel "stuck" (retries with backoff dominate wall-clock time).
+ */
+const MAX_CONCURRENT_FETCHES = 8;
+const MIN_GAP_MS = 35;
+/** Fail moderately fast; long hangs block the shared pool */
+const FETCH_TIMEOUT_MS = 9000;
 
-const CACHE_MAX = 4000;
+const CACHE_MAX = 6000;
 const translateCache = new Map();
 
 let activeFetches = 0;
@@ -258,7 +262,7 @@ async function ensureContentScript(tabId) {
 
   try {
     await chrome.scripting.insertCSS({
-      target: { tabId, allFrames: true },
+      target: { tabId, allFrames: false },
       files: ["content.css"],
     });
   } catch {
@@ -267,7 +271,7 @@ async function ensureContentScript(tabId) {
 
   try {
     await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
+      target: { tabId, allFrames: false },
       files: [
         "shared/protocol.js",
         "shared/markers.js",
@@ -409,48 +413,29 @@ async function reportToolbarFailure(tabId, reason) {
   }
 }
 
+/** Top frame only — iframe fan-out multiplies rate limits and main-thread work. */
 async function broadcastToggle(tabId) {
-  let frameIds = [0];
   try {
-    if (chrome.webNavigation && chrome.webNavigation.getAllFrames) {
-      const frames = await chrome.webNavigation.getAllFrames({ tabId });
-      if (frames && frames.length) frameIds = frames.map((f) => f.frameId);
-    }
+    await chrome.tabs.sendMessage(
+      tabId,
+      { type: Msg.TOGGLE || "DE_EN_TOGGLE", v: 1 },
+      { frameId: 0 }
+    );
   } catch {
-    /* main frame only */
+    /* no content script */
   }
-
-  await Promise.all(
-    frameIds.map((frameId) =>
-      chrome.tabs
-        .sendMessage(tabId, { type: Msg.TOGGLE || "DE_EN_TOGGLE", v: 1 }, { frameId })
-        .catch(() => {})
-    )
-  );
 }
 
 async function broadcastPowerOn(tabId) {
-  let frameIds = [0];
   try {
-    if (chrome.webNavigation && chrome.webNavigation.getAllFrames) {
-      const frames = await chrome.webNavigation.getAllFrames({ tabId });
-      if (frames && frames.length) frameIds = frames.map((f) => f.frameId);
-    }
+    await chrome.tabs.sendMessage(
+      tabId,
+      { type: Msg.POWER_ON || "DE_EN_POWER_ON", v: 1 },
+      { frameId: 0 }
+    );
   } catch {
-    /* main frame only */
+    /* ignore */
   }
-  await Promise.all(
-    frameIds.map((frameId) =>
-      chrome.tabs
-        .sendMessage(
-          tabId,
-          { type: Msg.POWER_ON || "DE_EN_POWER_ON", v: 1 },
-          { frameId }
-        )
-        .catch(() => {})
-    )
-  );
-  // Also expand panel on top frame
   try {
     await chrome.tabs.sendMessage(
       tabId,

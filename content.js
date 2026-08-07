@@ -74,26 +74,34 @@
       return Object.assign({ v: 1, type: type }, payload || {});
     };
 
-  /** Larger packs = fewer HTTP requests = much faster */
-  const MAX_PACK_CHARS = 3200;
-  let packSeq = 0;
-  const MAX_ENCODED_HINT = 4600;
-  /** Match SW pool — fire many translates at once */
-  const CONCURRENCY = 24;
-  const MIN_RETRANSLATE_GAP_MS = 800;
-  const OBSERVER_DEBOUNCE_MS = 400;
-  /** Yield less often so collection finishes faster */
-  const WALK_YIELD_EVERY = 2000;
-  /** G4: hard cap tracked nodes to limit memory */
-  const MAX_TRACKED_NODES = 12000;
-  const MAX_HASH_SET = 16000;
   /**
-   * Higher caps — still bounded, but allow big pages in one pass.
+   * Perf v1.9 — balance fewer HTTP calls vs marker reliability / 429s.
+   * Smaller packs + moderate concurrency beat "24 parallel until rate-limited".
    */
-  const MAX_CHUNKS_PER_RUN = 200;
-  const MAX_ITEMS_PER_RUN = 6000;
-  /** How many packed strings per SW batch message (IPC efficiency) */
-  const SW_BATCH_WAVE = 40;
+  const MAX_PACK_CHARS = 2400;
+  let packSeq = 0;
+  const MAX_ENCODED_HINT = 3800;
+  /** Match SW pool (background uses 8) */
+  const CONCURRENCY = 8;
+  /** Fewer strings per pack → fewer private-use marker remap failures */
+  const MAX_ITEMS_PER_PACK = 24;
+  const MIN_RETRANSLATE_GAP_MS = 2800;
+  const OBSERVER_DEBOUNCE_MS = 1000;
+  /** Yield less often during walk (visibility is cheaper now) */
+  const WALK_YIELD_EVERY = 5000;
+  /** G4: hard cap tracked nodes to limit memory */
+  const MAX_TRACKED_NODES = 8000;
+  const MAX_HASH_SET = 12000;
+  const MAX_CHUNKS_PER_RUN = 100;
+  const MAX_ITEMS_PER_RUN = 3500;
+  /** Packed strings per SW batch message */
+  const SW_BATCH_WAVE = 16;
+  /** Skip slow on-device Translator probe (network path is the reliable one) */
+  const USE_LOCAL_TRANSLATOR = false;
+  /** Top document only (manifest all_frames=false); belt-and-suspenders */
+  const TOP_FRAME_ONLY = true;
+  /** Progress UI throttle */
+  const PROGRESS_UI_MS = 150;
 
   const DEFAULT_HIDDEN_HOSTS = [
     "chrome.google.com",
@@ -194,25 +202,50 @@
     if (root && root.host) return root.host;
     return null;
   }
+  /**
+   * Visibility cache for one collect walk. Prefer checkVisibility() (one call,
+   * engine walks ancestors) over per-ancestor getComputedStyle thrashing.
+   * @type {WeakMap<Element, boolean>|null}
+   */
+  let visibilityCache = null;
+
   function isVisible(el) {
     if (!el || !(el instanceof Element)) return true;
-    let e = el;
-    while (e) {
-      if (e.nodeType === 1) {
-        if (e.hasAttribute("hidden")) return false;
-        if (e.getAttribute("aria-hidden") === "true") return false;
-        if (e.getAttribute("data-no-translate") != null) return false;
-        if (e.id === "__de_en_host") return false;
-        let style;
-        try { style = window.getComputedStyle(e); } catch { style = null; }
-        if (style) {
-          if (style.display === "none" || style.visibility === "hidden") return false;
-          if (parseFloat(style.opacity || "1") === 0) return false;
-        }
+    if (visibilityCache && visibilityCache.has(el)) return visibilityCache.get(el);
+
+    let ok = true;
+    if (el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true") {
+      ok = false;
+    } else if (el.getAttribute("data-no-translate") != null || el.id === "__de_en_host") {
+      ok = false;
+    } else if (typeof el.checkVisibility === "function") {
+      try {
+        ok = el.checkVisibility({
+          checkOpacity: true,
+          checkVisibilityCSS: true,
+          contentVisibilityAuto: true,
+        });
+      } catch {
+        ok = true;
       }
-      e = nextAncestor(e);
+    } else {
+      // Cheap fallback: style the element once (not the full ancestor chain)
+      try {
+        const style = window.getComputedStyle(el);
+        if (
+          style.display === "none" ||
+          style.visibility === "hidden" ||
+          parseFloat(style.opacity || "1") === 0
+        ) {
+          ok = false;
+        }
+      } catch {
+        ok = true;
+      }
     }
-    return true;
+
+    if (visibilityCache) visibilityCache.set(el, ok);
+    return ok;
   }
 
   /** Popups/modals often mount as display:none — still translate so open state is English. */
@@ -274,7 +307,10 @@
     return true;
   }
 
-  /** Extension API: open + closed shadow roots. */
+  /**
+   * Open shadow always. Closed shadow only on custom elements / is= hosts —
+   * probing every HTML node with openOrClosedShadowRoot is very expensive.
+   */
   function getShadowRoot(el) {
     if (!el) return null;
     try {
@@ -282,6 +318,9 @@
     } catch {
       /* ignore */
     }
+    const tag = el.tagName || "";
+    const isCustom = tag.includes("-") || el.hasAttribute("is");
+    if (!isCustom) return null;
     try {
       if (typeof chrome !== "undefined" && chrome.dom && chrome.dom.openOrClosedShadowRoot) {
         return chrome.dom.openOrClosedShadowRoot(el);
@@ -398,12 +437,27 @@
     return false;
   }
   function shouldTranslateText(text) {
-    if (!text || !String(text).trim()) return false;
-    if (looksLikeUrlOrCode(text)) return false;
-    if (/^[\d\s.,:;+%\-–—/\\|()[\]{}$€£¥]+$/.test(text.trim())) return false;
-    const h = hashStr(text);
+    if (!text) return false;
+    const raw = String(text);
+    const t = raw.trim();
+    if (t.length < 2) return false;
+    if (looksLikeUrlOrCode(raw)) return false;
+    if (/^[\d\s.,:;+%\-–—/\\|()[\]{}$€£¥]+$/.test(t)) return false;
+    const h = hashStr(raw);
     if (seenSourceHashes.has(h) || outputHashes.has(h)) return false;
-    if (looksMostlyEnglish(text) && !looksGermanSample(text)) return false;
+
+    // Short UI labels: skip heavy DE/EN scoring (major scan cost)
+    if (t.length < 14) {
+      if (/^[A-Za-z0-9+./@_-]{1,12}$/.test(t) && !/[äöüÄÖÜß]/.test(t)) {
+        // pure tokens / brands often not worth network
+        if (/^(ok|id|url|api|http|https|www|com|de|en|pdf|jpg|png|svg)$/i.test(t)) return false;
+      }
+      // umlauts or multi-word short UI → translate
+      return true;
+    }
+
+    // Medium+: only full score when it might be English-only
+    if (looksMostlyEnglish(raw) && !looksGermanSample(raw)) return false;
     return true;
   }
 
@@ -490,6 +544,25 @@
 
   function encodedLen(s) {
     try { return encodeURIComponent(s).length; } catch { return s.length * 3; }
+  }
+
+  /**
+   * Fast encoded-length estimate for packing (avoids encodeURIComponent on
+   * the whole growing pack for every item). Slightly pessimistic for safety.
+   */
+  function estimateEncodedLen(s) {
+    if (!s) return 0;
+    let n = 0;
+    const str = String(s);
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charCodeAt(i);
+      if (c === 32) n += 3; // %20
+      else if (c < 128) n += c === 37 || c === 38 || c === 43 || c === 61 ? 3 : 1;
+      else if (c < 0x800) n += 6;
+      else if (c < 0x10000) n += 9;
+      else n += 12;
+    }
+    return n;
   }
 
   function computeEffectiveAuto() {
@@ -668,7 +741,7 @@
   try { chrome.storage.onChanged.addListener(onStorageChanged); } catch { /* ignore */ }
 
   // ---------- DOM walk (G1: yield) ----------
-  /** Iterative DFS with yields — light DOM + open/closed shadow (chrome.dom). */
+  /** Iterative DFS with yields — light DOM + selective closed shadow. */
   async function collectWorkAsync(root, gen) {
     const textNodes = [];
     const attrTargets = [];
@@ -676,9 +749,13 @@
     const seenShadow = new Set();
     const stack = [root];
     let steps = 0;
+    visibilityCache = new WeakMap();
 
     while (stack.length) {
-      if (gen !== runGeneration) return { textNodes, attrTargets };
+      if (gen !== runGeneration) {
+        visibilityCache = null;
+        return { textNodes, attrTargets };
+      }
       const node = stack.pop();
       if (!node) continue;
       steps++;
@@ -691,26 +768,31 @@
         if (!text || !text.trim()) continue;
         const parent = node.parentElement;
         if (!parent) continue;
-        // Ancestor text-skip (script/style/textarea only)
-        let p = parent;
+        if (shouldSkipTextParent(parent)) continue;
+        // Cheap skip under script/style ancestors (tag only, no style calc)
+        let p = parent.parentElement;
         let skip = false;
         while (p) {
-          if (p.nodeType === 1) {
-            if (SKIP_TEXT_TAGS.has(p.tagName) || isOurUi(p)) {
-              skip = true;
-              break;
-            }
+          if (SKIP_TEXT_TAGS.has(p.tagName) || isOurUi(p)) {
+            skip = true;
+            break;
           }
-          p = nextAncestor(p);
+          p = p.parentElement;
         }
         if (skip) continue;
-        if (shouldSkipTextParent(parent)) continue;
         if (!shouldCollectNode(parent)) continue;
         if (originalTextByNode.has(node)) continue;
-        // Short button labels: always try
+        // Avoid closest() every node — tag/role checks first
+        const tag = parent.tagName;
         const inButton =
-          parent.closest &&
-          parent.closest("button, [role='button'], a.btn, input, label, option, summary");
+          tag === "BUTTON" ||
+          tag === "LABEL" ||
+          tag === "OPTION" ||
+          tag === "SUMMARY" ||
+          tag === "A" ||
+          (parent.getAttribute && parent.getAttribute("role") === "button") ||
+          (parent.closest &&
+            parent.closest("button, [role='button'], label, option, summary"));
         if (!inButton && !shouldTranslateText(text)) continue;
         if (inButton && looksLikeUrlOrCode(text)) continue;
         textNodes.push(node);
@@ -728,7 +810,6 @@
           }
         }
 
-        // Open or closed shadow root
         const sr = getShadowRoot(el);
         if (sr && !seenShadow.has(sr)) {
           seenShadow.add(sr);
@@ -741,12 +822,12 @@
         continue;
       }
 
-      // DocumentFragment / ShadowRoot
       if (node.childNodes) {
         const children = node.childNodes;
         for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
       }
     }
+    visibilityCache = null;
     return { textNodes, attrTargets };
   }
 
@@ -818,19 +899,46 @@
   function chunkItems(items) {
     const chunks = [];
     let current = [];
-    const flush = () => { if (current.length) { chunks.push(current); current = []; } };
+    let curChars = 0;
+    let curEnc = 0;
+    /** Private-use markers add ~30–50 encoded units each */
+    const MARKER_CHARS = 28;
+    const MARKER_ENC = 48;
+    const flush = () => {
+      if (current.length) {
+        chunks.push(current);
+        current = [];
+        curChars = 0;
+        curEnc = 0;
+      }
+    };
     for (const item of items) {
       const piece = item.value;
-      if (item.kind === "text" && (encodedLen(piece) > MAX_ENCODED_HINT || piece.length > MAX_PACK_CHARS)) {
-        flush(); chunks.push([{ ...item, _isLargeText: true }]); continue;
+      const pChars = piece.length;
+      const pEnc = estimateEncodedLen(piece);
+      if (item.kind === "text" && (pEnc > MAX_ENCODED_HINT || pChars > MAX_PACK_CHARS)) {
+        flush();
+        chunks.push([{ ...item, _isLargeText: true }]);
+        continue;
       }
-      if (item.kind === "attr" && (encodedLen(piece) > MAX_ENCODED_HINT || piece.length > MAX_PACK_CHARS)) {
-        flush(); chunks.push([{ ...item, _isLargeAttr: true }]); continue;
+      if (item.kind === "attr" && (pEnc > MAX_ENCODED_HINT || pChars > MAX_PACK_CHARS)) {
+        flush();
+        chunks.push([{ ...item, _isLargeAttr: true }]);
+        continue;
       }
-      const trial = current.concat([item]);
-      const packed = packChunk(trial);
-      if (current.length && (packed.length > MAX_PACK_CHARS || encodedLen(packed) > MAX_ENCODED_HINT)) flush();
+      if (current.length >= MAX_ITEMS_PER_PACK) flush();
+      const joinChars = current.length ? MARKER_CHARS : 0;
+      const joinEnc = current.length ? MARKER_ENC : 0;
+      if (
+        current.length &&
+        (curChars + joinChars + pChars > MAX_PACK_CHARS ||
+          curEnc + joinEnc + pEnc > MAX_ENCODED_HINT)
+      ) {
+        flush();
+      }
       current.push(item);
+      curChars += (current.length > 1 ? MARKER_CHARS : 0) + pChars;
+      curEnc += (current.length > 1 ? MARKER_ENC : 0) + pEnc;
     }
     flush();
     return chunks;
@@ -850,15 +958,15 @@
     return "Translation failed";
   }
 
-  // K3: optional on-device Translator API (Chrome) before network
+  // K3: optional on-device Translator — off by default (probe was slowing first wave)
   let chromeTranslator = null;
   let chromeTranslatorTried = false;
 
   async function getChromeTranslator() {
+    if (!USE_LOCAL_TRANSLATOR) return null;
     if (chromeTranslatorTried) return chromeTranslator;
     chromeTranslatorTried = true;
     try {
-      // K3: Chrome Translator API (when available in the browser)
       if (typeof globalThis.Translator !== "undefined" && globalThis.Translator.create) {
         if (globalThis.Translator.availability) {
           const availability = await globalThis.Translator.availability({
@@ -993,6 +1101,57 @@
     finally { queueMicrotask(() => { applyingMutations = false; }); }
   }
 
+  /** Batched DOM applies — coalesce writes into animation frames */
+  let applyQueue = [];
+  let applyFlushScheduled = false;
+
+  function scheduleApplyFlush() {
+    if (applyFlushScheduled) return;
+    applyFlushScheduled = true;
+    const run = () => {
+      applyFlushScheduled = false;
+      if (!applyQueue.length) return;
+      const batch = applyQueue;
+      applyQueue = [];
+      applyingMutations = true;
+      try {
+        for (let i = 0; i < batch.length; i++) {
+          const job = batch[i];
+          if (!isGenCurrent(job.gen) || job.t == null || job.t === "") continue;
+          const item = job.item;
+          const source = job.source;
+          seenSourceHashes.add(hashStr(source));
+          outputHashes.add(hashStr(job.t));
+          if (item.kind === "text") {
+            const node = item.node;
+            if (!node) continue;
+            if (!originalTextByNode.has(node)) trackOriginal(node, source);
+            if (node.isConnected) node.nodeValue = job.t;
+          } else if (item.kind === "attr") {
+            const el = item.el;
+            if (!el || !el.isConnected) continue;
+            let bag = originalAttrsByEl.get(el);
+            if (!bag) {
+              bag = {};
+              originalAttrsByEl.set(el, bag);
+            }
+            if (bag[item.attr] == null) bag[item.attr] = source;
+            setTranslatableAttr(el, item.attr, job.t);
+          }
+        }
+        capSet(seenSourceHashes, MAX_HASH_SET);
+        capSet(outputHashes, MAX_HASH_SET);
+      } finally {
+        queueMicrotask(() => {
+          applyingMutations = false;
+        });
+      }
+      if (applyQueue.length) scheduleApplyFlush();
+    };
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+    else setTimeout(run, 0);
+  }
+
   function trackOriginal(node, source) {
     if (originalTextByNode.size >= MAX_TRACKED_NODES) pruneDisconnected();
     if (originalTextByNode.size >= MAX_TRACKED_NODES) {
@@ -1010,30 +1169,48 @@
   function applyItemTranslation(item, t, gen) {
     if (!isGenCurrent(gen) || t == null || t === "") return false;
     const source = item.fullOriginal != null ? item.fullOriginal : item.value;
-    seenSourceHashes.add(hashStr(source));
-    outputHashes.add(hashStr(t));
-    capSet(seenSourceHashes, MAX_HASH_SET);
-    capSet(outputHashes, MAX_HASH_SET);
+    applyQueue.push({ item, t, gen, source });
+    scheduleApplyFlush();
+    return true;
+  }
 
-    return withOwnMutation(() => {
-      if (item.kind === "text") {
-        const node = item.node;
-        if (!node) return false;
-        if (!originalTextByNode.has(node)) trackOriginal(node, source);
-        if (node.isConnected) node.nodeValue = t;
-        return true;
+  /** Force pending applies (before restore / generation bump). */
+  function flushAppliesSync() {
+    if (!applyQueue.length) return;
+    applyFlushScheduled = false;
+    const batch = applyQueue;
+    applyQueue = [];
+    applyingMutations = true;
+    try {
+      for (let i = 0; i < batch.length; i++) {
+        const job = batch[i];
+        if (!isGenCurrent(job.gen) || job.t == null || job.t === "") continue;
+        const item = job.item;
+        const source = job.source;
+        seenSourceHashes.add(hashStr(source));
+        outputHashes.add(hashStr(job.t));
+        if (item.kind === "text") {
+          const node = item.node;
+          if (!node) continue;
+          if (!originalTextByNode.has(node)) trackOriginal(node, source);
+          if (node.isConnected) node.nodeValue = job.t;
+        } else if (item.kind === "attr") {
+          const el = item.el;
+          if (!el || !el.isConnected) continue;
+          let bag = originalAttrsByEl.get(el);
+          if (!bag) {
+            bag = {};
+            originalAttrsByEl.set(el, bag);
+          }
+          if (bag[item.attr] == null) bag[item.attr] = source;
+          setTranslatableAttr(el, item.attr, job.t);
+        }
       }
-      if (item.kind === "attr") {
-        const el = item.el;
-        if (!el || !el.isConnected) return false;
-        let bag = originalAttrsByEl.get(el);
-        if (!bag) { bag = {}; originalAttrsByEl.set(el, bag); }
-        if (bag[item.attr] == null) bag[item.attr] = source;
-        setTranslatableAttr(el, item.attr, t);
-        return true;
-      }
-      return false;
-    });
+      capSet(seenSourceHashes, MAX_HASH_SET);
+      capSet(outputHashes, MAX_HASH_SET);
+    } finally {
+      applyingMutations = false;
+    }
   }
 
   async function translateLargeTextNode(item, gen) {
@@ -1106,20 +1283,23 @@
       if (!isGenCurrent(gen)) return;
       const parts = unpackChunk(translatedFull, items.length, packId);
       items.forEach((item, i) => applyItemTranslation(item, parts[i], gen));
-    } catch (err) {
-      // L: marker failure → fall back to per-item requests (no markers)
-      if (!/Marker remap|timed out|429|403/i.test(String(err && err.message ? err.message : err))) {
-        // still try individual for remap; for other errors rethrow after individuals fail
-      }
-      for (const item of items) {
-        if (!isGenCurrent(gen)) return;
-        try {
-          const solo = await translateViaBackground(sanitizeForPack(item.value));
-          applyItemTranslation(item, solo, gen);
-        } catch {
-          /* leave original for this item */
-        }
-      }
+    } catch {
+      // Marker / network fail → parallel per-item (not sequential) with pool limit
+      if (!isGenCurrent(gen)) return;
+      await mapPool(
+        items,
+        Math.min(CONCURRENCY, 6),
+        async (item) => {
+          if (!isGenCurrent(gen)) return;
+          try {
+            const solo = await translateViaBackground(sanitizeForPack(item.value));
+            applyItemTranslation(item, solo, gen);
+          } catch {
+            /* leave original */
+          }
+        },
+        gen
+      );
     }
   }
 
@@ -1197,24 +1377,49 @@
     }, 400);
   }
 
-  function setProgress(done, total) {
+  let lastProgressUiAt = 0;
+  let lastProgressDone = -1;
+
+  function setProgress(done, total, force) {
     if (!progressEl) return;
     if (!total) {
       progressEl.hidden = true;
       progressEl.style.setProperty("--p", "0%");
       progressEl.setAttribute("aria-valuenow", "0");
+      lastProgressDone = -1;
       if (statusLineEl && phase !== "translating") statusLineEl.textContent = translated ? "Showing English" : "";
       return;
     }
+    const now = Date.now();
+    const isMilestone = done === 0 || done === total || done === 1;
+    if (
+      !force &&
+      !isMilestone &&
+      done === lastProgressDone
+    ) {
+      return;
+    }
+    if (!force && !isMilestone && now - lastProgressUiAt < PROGRESS_UI_MS) {
+      return;
+    }
+    lastProgressUiAt = now;
+    lastProgressDone = done;
     progressEl.hidden = false;
     const pct = Math.round((done / total) * 100);
     progressEl.style.setProperty("--p", pct + "%");
     progressEl.setAttribute("aria-valuenow", String(pct));
     progressEl.setAttribute("aria-valuetext", `Translating ${done} of ${total}`);
     if (statusLineEl) statusLineEl.textContent = `Translating ${done} / ${total}`;
-    // only announce milestones (J: less SR spam)
-    if (done === 1 || done === total || done % 5 === 0) {
+    if (done === 1 || done === total || done % 10 === 0) {
       announce(`Translating ${done} of ${total}`);
+    }
+  }
+
+  function bumpProgress(done, total, quiet) {
+    setProgress(done, total, false);
+    // Throttle toast badges hard (DOM in shadow)
+    if (!quiet && (done === total || done === 1 || done % 12 === 0)) {
+      showBadge(`Translating ${done}/${total}…`, 2000);
     }
   }
 
@@ -1227,7 +1432,8 @@
     }
   }
 
-  async function translatePage({ quiet } = {}) {
+  async function translatePage({ quiet, roots } = {}) {
+    if (TOP_FRAME_ONLY && !IS_TOP) return;
     if (phase === "translating" || phase === "restoring") return;
     if (!(await ensurePrivacyAccepted())) {
       if (!quiet) showBadge("Accept privacy notice to translate");
@@ -1241,13 +1447,26 @@
     lastError = false;
     lastErrorDetail = "";
     setUiLoading(true);
-    setProgress(0, 1);
+    setProgress(0, 1, true);
     if (!quiet) showBadge("Scanning page…");
 
     try {
       pruneDisconnected();
-      const root = document.body || document.documentElement;
-      const { textNodes, attrTargets } = await collectWorkAsync(root, gen);
+      // Subtree mode (SPA observer): only scan added roots, not the whole document
+      const scanRoots =
+        roots && roots.length
+          ? roots.filter((r) => r && (r.isConnected !== false))
+          : [document.body || document.documentElement];
+
+      let textNodes = [];
+      let attrTargets = [];
+      for (const root of scanRoots) {
+        if (!isGenCurrent(gen)) return;
+        if (!root) continue;
+        const part = await collectWorkAsync(root, gen);
+        if (part.textNodes.length) textNodes = textNodes.concat(part.textNodes);
+        if (part.attrTargets.length) attrTargets = attrTargets.concat(part.attrTargets);
+      }
       if (!isGenCurrent(gen)) return;
       let items = buildWorkItems(textNodes, attrTargets);
 
@@ -1307,14 +1526,11 @@
       // Run large-node jobs with pool; packed jobs in SW_BATCH_WAVE parallel batches
       const largePool = mapPool(
         largeJobs,
-        Math.min(CONCURRENCY, 8),
+        Math.min(CONCURRENCY, 4),
         async (job) => {
           await translateChunkItems(job.chunk, gen);
           done++;
-          if (isGenCurrent(gen)) {
-            setProgress(done, total);
-            if (!quiet) showBadge(`Translating ${done}/${total}…`, 2500);
-          }
+          if (isGenCurrent(gen)) bumpProgress(done, total, quiet);
         },
         gen
       );
@@ -1328,7 +1544,6 @@
           try {
             results = await translateBatchViaBackground(texts);
           } catch {
-            // Fallback: per-chunk high concurrency
             await mapPool(
               wave,
               CONCURRENCY,
@@ -1339,10 +1554,7 @@
                   failed++;
                 }
                 done++;
-                if (isGenCurrent(gen)) {
-                  setProgress(done, total);
-                  if (!quiet) showBadge(`Translating ${done}/${total}…`, 2500);
-                }
+                if (isGenCurrent(gen)) bumpProgress(done, total, quiet);
               },
               gen
             );
@@ -1354,38 +1566,44 @@
             const r = results[j];
             try {
               if (!r || !r.ok) {
-                // single retry path
                 await translateChunkItems(job.chunk, gen);
               } else if (job.chunk.length === 1) {
                 applyItemTranslation(job.chunk[0], r.translated, gen);
               } else {
-                const parts = unpackChunk(r.translated, job.chunk.length, job.packId);
-                job.chunk.forEach((item, idx) =>
-                  applyItemTranslation(item, parts[idx], gen)
-                );
+                try {
+                  const parts = unpackChunk(r.translated, job.chunk.length, job.packId);
+                  job.chunk.forEach((item, idx) =>
+                    applyItemTranslation(item, parts[idx], gen)
+                  );
+                } catch {
+                  // Parallel per-item fallback (not sequential)
+                  await mapPool(
+                    job.chunk,
+                    Math.min(CONCURRENCY, 6),
+                    async (item) => {
+                      if (!isGenCurrent(gen)) return;
+                      try {
+                        const solo = await translateViaBackground(sanitizeForPack(item.value));
+                        applyItemTranslation(item, solo, gen);
+                      } catch {
+                        /* leave */
+                      }
+                    },
+                    gen
+                  );
+                }
               }
             } catch {
-              try {
-                // L fallback: individual
-                for (const item of job.chunk) {
-                  if (!isGenCurrent(gen)) break;
-                  const solo = await translateViaBackground(sanitizeForPack(item.value));
-                  applyItemTranslation(item, solo, gen);
-                }
-              } catch {
-                failed++;
-              }
+              failed++;
             }
             done++;
-            if (isGenCurrent(gen)) {
-              setProgress(done, total);
-              if (!quiet) showBadge(`Translating ${done}/${total}…`, 2500);
-            }
+            if (isGenCurrent(gen)) bumpProgress(done, total, quiet);
           }
         }
       }
 
       await Promise.all([largePool, runPackedWaves()]);
+      flushAppliesSync();
 
       if (!isGenCurrent(gen)) return;
       pruneDisconnected();
@@ -1395,18 +1613,18 @@
       lastRetranslateAt = Date.now();
       if (failed > 0 && failed < total) {
         lastErrorDetail = `Partial: ${total - failed}/${total} ok`;
-        showBadge(lastErrorDetail);
+        if (!quiet) showBadge(lastErrorDetail);
         lastError = false;
       } else if (failed >= total && total > 0) {
         lastErrorDetail = "All chunks failed — rate limit or network? Toggle again to retry.";
-        showBadge(lastErrorDetail, 5000);
+        if (!quiet) showBadge(lastErrorDetail, 5000);
         lastError = true;
       } else if (chunksCapped || itemsCapped) {
         lastErrorDetail = `Partial: large page — translated first ${total} chunks (toggle again for more)`;
-        showBadge(lastErrorDetail, 5000);
+        if (!quiet) showBadge(lastErrorDetail, 5000);
         lastError = false;
       } else {
-        showBadge("Translated to English");
+        if (!quiet) showBadge("Translated to English");
         lastError = false;
         lastErrorDetail = "";
       }
@@ -1415,14 +1633,14 @@
       if (!isGenCurrent(gen)) return;
       console.error("[DE-EN Translator]", e);
       lastErrorDetail = friendlyError(e);
-      showBadge(lastErrorDetail, 5000);
+      if (!quiet) showBadge(lastErrorDetail, 5000);
       lastError = true;
       pushActionState({ error: true });
     } finally {
       if (isGenCurrent(gen)) {
         phase = "idle";
         setUiLoading(false);
-        setProgress(0, 0);
+        setProgress(0, 0, true);
         pushActionState({ error: lastError });
       }
     }
@@ -1432,9 +1650,11 @@
     // R1: bump generation so any in-flight translateChunk applies are ignored
     const gen = ++runGeneration;
     phase = "restoring";
+    applyQueue = [];
+    applyFlushScheduled = false;
     stopObserver();
     setUiLoading(false);
-    setProgress(0, 0);
+    setProgress(0, 0, true);
     // Yield so pending microtasks see the new generation before we rewrite DOM
     await Promise.resolve();
     await Promise.resolve();
@@ -1463,6 +1683,7 @@
 
   async function runToggleLocal() {
     if (!extensionEnabled) return;
+    if (TOP_FRAME_ONLY && !IS_TOP) return;
     if (phase === "translating") {
       showBadge("Cancelling…");
       await restorePage();
@@ -1475,6 +1696,7 @@
 
   async function runToggle() {
     if (!extensionEnabled) return;
+    if (TOP_FRAME_ONLY && !IS_TOP) return;
     if (IS_TOP) {
       try {
         await new Promise((resolve) => {
@@ -1486,15 +1708,28 @@
     await runToggleLocal();
   }
 
-  function scheduleQuietRetranslate() {
+  /** Pending subtrees for quiet retranslate (not full-document) */
+  let pendingScanRoots = [];
+
+  function scheduleQuietRetranslate(roots) {
     if (!translated || phase !== "idle") return;
+    if (roots && roots.length) {
+      for (const r of roots) {
+        if (r && pendingScanRoots.indexOf(r) === -1) pendingScanRoots.push(r);
+      }
+    }
     const now = Date.now();
     const wait = Math.max(OBSERVER_DEBOUNCE_MS, MIN_RETRANSLATE_GAP_MS - (now - lastRetranslateAt));
     clearTimeout(retranslateTimer);
     retranslateTimer = setTimeout(() => {
       if (!translated || phase !== "idle" || document.hidden) return;
       lastRetranslateAt = Date.now();
-      translatePage({ quiet: true });
+      const scan = pendingScanRoots.splice(0, pendingScanRoots.length);
+      // Cap roots to avoid huge batches from chatty SPAs
+      const limited = scan.slice(0, 40);
+      if (limited.length) {
+        translatePage({ quiet: true, roots: limited });
+      }
     }, wait);
   }
 
@@ -1502,59 +1737,58 @@
     if (observer || !document.documentElement) return;
     observer = new MutationObserver((mutations) => {
       if (!translated || phase !== "idle" || applyingMutations || document.hidden) return;
-      let relevant = false;
+      const roots = [];
       for (const m of mutations) {
-        if (m.type === "attributes") {
+        if (m.type === "childList" && m.addedNodes && m.addedNodes.length) {
+          for (const n of m.addedNodes) {
+            if (n.nodeType === Node.ELEMENT_NODE) {
+              if (isOurUi(n)) continue;
+              roots.push(n);
+            } else if (n.nodeType === Node.TEXT_NODE && n.parentElement && !isOurUi(n.parentElement)) {
+              roots.push(n.parentElement);
+            }
+          }
+        } else if (m.type === "characterData") {
+          const node = m.target;
+          if (node && originalTextByNode.has(node)) originalTextByNode.delete(node);
+          if (node && node.parentElement && !isOurUi(node.parentElement)) {
+            roots.push(node.parentElement);
+          }
+        } else if (m.type === "attributes") {
           const el = m.target;
           if (!el || isOurUi(el)) continue;
-          // Popup open / visibility toggles
+          // Only attrs we translate or open/hidden for popups — never class/style
           if (
             m.attributeName === "open" ||
             m.attributeName === "popover" ||
             m.attributeName === "hidden" ||
-            m.attributeName === "aria-hidden" ||
-            m.attributeName === "class" ||
-            m.attributeName === "style"
+            m.attributeName === "aria-hidden"
           ) {
-            relevant = true;
-            break;
+            roots.push(el);
+          } else if (ATTRS_TO_TRANSLATE.includes(m.attributeName)) {
+            if (originalAttrsByEl.has(el)) {
+              const bag = originalAttrsByEl.get(el);
+              if (bag && bag[m.attributeName] != null) delete bag[m.attributeName];
+            }
+            roots.push(el);
           }
-          if (originalAttrsByEl.has(el)) originalAttrsByEl.delete(el);
-          relevant = true;
-          break;
-        }
-        if (m.type === "characterData") {
-          const node = m.target;
-          if (node && originalTextByNode.has(node)) originalTextByNode.delete(node);
-          relevant = true;
-          break;
-        }
-        if (m.type === "childList" && m.addedNodes && m.addedNodes.length) {
-          for (const n of m.addedNodes) {
-            if (n.nodeType === Node.ELEMENT_NODE && isOurUi(n)) continue;
-            // New popup nodes / shadow hosts
-            relevant = true;
-            break;
-          }
-          if (relevant) break;
         }
       }
-      if (!relevant) return;
+      if (!roots.length) return;
       clearTimeout(mutateTimer);
-      mutateTimer = setTimeout(() => scheduleQuietRetranslate(), OBSERVER_DEBOUNCE_MS);
+      mutateTimer = setTimeout(() => scheduleQuietRetranslate(roots), OBSERVER_DEBOUNCE_MS);
     });
     observer.observe(document.documentElement, {
       childList: true,
       subtree: true,
       characterData: true,
       attributes: true,
+      // Intentionally NO class/style — SPA class toggles were re-scanning the whole page
       attributeFilter: ATTRS_TO_TRANSLATE.concat([
         "open",
         "popover",
         "hidden",
         "aria-hidden",
-        "class",
-        "style",
         "value",
       ]),
     });
@@ -1566,6 +1800,7 @@
     clearTimeout(retranslateTimer);
     mutateTimer = null;
     retranslateTimer = null;
+    pendingScanRoots = [];
   }
 
   // ---------- UI ----------
@@ -2721,6 +2956,9 @@
   };
 
   async function init() {
+    // Iframes no longer receive this script (all_frames=false); keep guard
+    if (TOP_FRAME_ONLY && !IS_TOP) return;
+
     await loadPrefs();
 
     // Soft-off: stay quiet but keep listeners so toolbar can power back on

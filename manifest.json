@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DE \u2192 EN Page Translator",
-  "version": "1.8.5",
-  "description": "Fast DE\u2192EN page translator: parallel batching, high concurrency, large packs.",
+  "version": "1.9.0",
+  "description": "Fast DE\u2192EN page translator: top-frame, throttled network, lighter DOM scan.",
   "permissions": [
     "activeTab",
     "scripting",
@@ -29,7 +29,7 @@
         "content.js"
       ],
       "run_at": "document_idle",
-      "all_frames": true
+      "all_frames": false
     }
   ],
   "web_accessible_resources": [

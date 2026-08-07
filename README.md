@@ -2,7 +2,7 @@
 
 Toggle-translate any webpage from **German to English**, in place. Free — no API key (Google public translate endpoint via the extension service worker).
 
-**v1.8** — E2E scenario hardening (huge-page caps, clearer progress/errors), documented strengths + five priority fixes, `npm run verify`.
+**v1.9** — Performance: top-frame only, lighter DOM scan, subtree SPA retranslate, throttled network (fewer 429s), batched DOM applies.
 
 ## Install (unpacked)
 
@@ -29,7 +29,7 @@ Toggle-translate any webpage from **German to English**, in place. Free — no A
 
 ## What is translated
 
-- Light DOM + **open shadow roots** (all frames)
+- Light DOM + **open shadow roots** (top frame); **closed shadow** only on custom elements
 - Attributes: `title`, `alt`, `aria-label`, `placeholder`, `aria-description`
 - Dynamic content via rate-limited `MutationObserver`
 
@@ -60,7 +60,8 @@ Load **one** unpacked path only (avoid Desktop + Downloads duplicates).
 
 ## Limitations
 
-- Closed shadow roots on the **page** cannot be read.
+- **Top frame only** — nested iframes are not translated (by design, for speed).
+- Closed shadow roots are only probed on **custom elements** (`tag-with-dash` / `is=`).
 - Unofficial Google endpoint may rate-limit; personal use only.
 - Restricted pages (`chrome://`, etc.) cannot be scripted.
 
