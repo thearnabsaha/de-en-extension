@@ -75,33 +75,30 @@
     };
 
   /**
-   * Perf v1.9 — balance fewer HTTP calls vs marker reliability / 429s.
-   * Smaller packs + moderate concurrency beat "24 parallel until rate-limited".
+   * Perf v1.9.1 — viewport-first + stream applies + full parallel packs.
+   * Sequential waves were the "wait forever" bug: N waves × network RTT.
    */
-  const MAX_PACK_CHARS = 2400;
+  const MAX_PACK_CHARS = 3600;
   let packSeq = 0;
-  const MAX_ENCODED_HINT = 3800;
-  /** Match SW pool (background uses 8) */
-  const CONCURRENCY = 8;
-  /** Fewer strings per pack → fewer private-use marker remap failures */
-  const MAX_ITEMS_PER_PACK = 24;
-  const MIN_RETRANSLATE_GAP_MS = 2800;
-  const OBSERVER_DEBOUNCE_MS = 1000;
-  /** Yield less often during walk (visibility is cheaper now) */
-  const WALK_YIELD_EVERY = 5000;
-  /** G4: hard cap tracked nodes to limit memory */
+  const MAX_ENCODED_HINT = 4500;
+  /** Match SW pool (~16) */
+  const CONCURRENCY = 14;
+  const MAX_ITEMS_PER_PACK = 36;
+  const MIN_RETRANSLATE_GAP_MS = 3500;
+  const OBSERVER_DEBOUNCE_MS = 1200;
+  /** Almost never yield mid-scan for typical pages */
+  const WALK_YIELD_EVERY = 12000;
   const MAX_TRACKED_NODES = 8000;
   const MAX_HASH_SET = 12000;
-  const MAX_CHUNKS_PER_RUN = 100;
-  const MAX_ITEMS_PER_RUN = 3500;
-  /** Packed strings per SW batch message */
-  const SW_BATCH_WAVE = 16;
-  /** Skip slow on-device Translator probe (network path is the reliable one) */
+  /** Hard caps — finish fast; user can toggle again for more */
+  const MAX_CHUNKS_PER_RUN = 80;
+  const MAX_ITEMS_PER_RUN = 2500;
+  /** Viewport pass: only this many items for instant first paint */
+  const MAX_VIEWPORT_ITEMS = 180;
+  const MAX_VIEWPORT_CHUNKS = 24;
   const USE_LOCAL_TRANSLATOR = false;
-  /** Top document only (manifest all_frames=false); belt-and-suspenders */
   const TOP_FRAME_ONLY = true;
-  /** Progress UI throttle */
-  const PROGRESS_UI_MS = 150;
+  const PROGRESS_UI_MS = 200;
 
   const DEFAULT_HIDDEN_HOSTS = [
     "chrome.google.com",
@@ -741,21 +738,42 @@
   try { chrome.storage.onChanged.addListener(onStorageChanged); } catch { /* ignore */ }
 
   // ---------- DOM walk (G1: yield) ----------
-  /** Iterative DFS with yields — light DOM + selective closed shadow. */
-  async function collectWorkAsync(root, gen) {
+  /**
+   * @param {Node} root
+   * @param {number} gen
+   * @param {{ textOnly?: boolean, viewportOnly?: boolean, maxItems?: number }} [opts]
+   */
+  async function collectWorkAsync(root, gen, opts) {
+    const textOnly = !!(opts && opts.textOnly);
+    const viewportOnly = !!(opts && opts.viewportOnly);
+    const maxItems = opts && opts.maxItems > 0 ? opts.maxItems : 0;
     const textNodes = [];
     const attrTargets = [];
     const seenEl = new Set();
     const seenShadow = new Set();
     const stack = [root];
     let steps = 0;
+    let itemCount = 0;
     visibilityCache = new WeakMap();
+    const vh = window.innerHeight || 800;
+    const vw = window.innerWidth || 1200;
+
+    function elInViewport(el) {
+      try {
+        const r = el.getBoundingClientRect();
+        // Include a little below fold so first scroll still works
+        return r.bottom > -40 && r.top < vh + 120 && r.right > 0 && r.left < vw;
+      } catch {
+        return true;
+      }
+    }
 
     while (stack.length) {
       if (gen !== runGeneration) {
         visibilityCache = null;
         return { textNodes, attrTargets };
       }
+      if (maxItems && itemCount >= maxItems) break;
       const node = stack.pop();
       if (!node) continue;
       steps++;
@@ -769,7 +787,6 @@
         const parent = node.parentElement;
         if (!parent) continue;
         if (shouldSkipTextParent(parent)) continue;
-        // Cheap skip under script/style ancestors (tag only, no style calc)
         let p = parent.parentElement;
         let skip = false;
         while (p) {
@@ -780,9 +797,9 @@
           p = p.parentElement;
         }
         if (skip) continue;
+        if (viewportOnly && !elInViewport(parent)) continue;
         if (!shouldCollectNode(parent)) continue;
         if (originalTextByNode.has(node)) continue;
-        // Avoid closest() every node — tag/role checks first
         const tag = parent.tagName;
         const inButton =
           tag === "BUTTON" ||
@@ -790,23 +807,40 @@
           tag === "OPTION" ||
           tag === "SUMMARY" ||
           tag === "A" ||
-          (parent.getAttribute && parent.getAttribute("role") === "button") ||
-          (parent.closest &&
-            parent.closest("button, [role='button'], label, option, summary"));
+          (parent.getAttribute && parent.getAttribute("role") === "button");
         if (!inButton && !shouldTranslateText(text)) continue;
         if (inButton && looksLikeUrlOrCode(text)) continue;
         textNodes.push(node);
+        itemCount++;
         continue;
       }
 
       if (node.nodeType === Node.ELEMENT_NODE) {
         const el = /** @type {Element} */ (node);
+        if (viewportOnly && el.nodeType === 1 && !elInViewport(el)) {
+          // Still descend: children may be in view even if parent rect is huge
+          // Only skip leaf-heavy branches when clearly off-screen far away
+          try {
+            const r = el.getBoundingClientRect();
+            if (r.bottom < -200 || r.top > vh + 400) continue;
+          } catch {
+            /* descend */
+          }
+        }
         if (!seenEl.has(el)) {
           seenEl.add(el);
-          if (!shouldSkipAttrElement(el) && shouldCollectNode(el)) {
+          if (
+            !textOnly &&
+            !shouldSkipAttrElement(el) &&
+            shouldCollectNode(el) &&
+            (!viewportOnly || elInViewport(el))
+          ) {
             const existing = originalAttrsByEl.get(el) || {};
             const pending = collectAttrsForElement(el, existing);
-            if (Object.keys(pending).length) attrTargets.push({ el, attrs: pending });
+            if (Object.keys(pending).length) {
+              attrTargets.push({ el, attrs: pending });
+              itemCount += Object.keys(pending).length;
+            }
           }
         }
 
@@ -829,6 +863,21 @@
     }
     visibilityCache = null;
     return { textNodes, attrTargets };
+  }
+
+  function itemInViewport(item) {
+    try {
+      const el =
+        item.kind === "text"
+          ? item.node && item.node.parentElement
+          : item.el;
+      if (!el || !el.getBoundingClientRect) return false;
+      const r = el.getBoundingClientRect();
+      const vh = window.innerHeight || 800;
+      return r.bottom > -20 && r.top < vh + 80;
+    } catch {
+      return false;
+    }
   }
 
   function buildWorkItems(textNodes, attrTargets) {
@@ -1008,21 +1057,20 @@
   }
 
   function translateViaBackground(text) {
-    return new Promise(async (resolve, reject) => {
+    // Direct network path — no local Translator probe (was adding latency)
+    return new Promise((resolve, reject) => {
       try {
-        const local = await translateLocalFirst(text);
-        if (local != null) {
-          resolve(local);
-          return;
-        }
-        chrome.runtime.sendMessage(makeMsg(Msg.TRANSLATE || "DE_EN_TRANSLATE", { text }), (res) => {
-          if (chrome.runtime.lastError) {
-            reject(new Error(chrome.runtime.lastError.message));
-            return;
+        chrome.runtime.sendMessage(
+          makeMsg(Msg.TRANSLATE || "DE_EN_TRANSLATE", { text }),
+          (res) => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message));
+              return;
+            }
+            if (!res || !res.ok) reject(new Error((res && res.error) || "Translation failed"));
+            else resolve(res.translated);
           }
-          if (!res || !res.ok) reject(new Error((res && res.error) || "Translation failed"));
-          else resolve(res.translated);
-        });
+        );
       } catch (e) {
         reject(e);
       }
@@ -1030,28 +1078,8 @@
   }
 
   function translateBatchViaBackground(texts) {
-    return new Promise(async (resolve, reject) => {
+    return new Promise((resolve, reject) => {
       try {
-        // Local translator: parallel map for speed
-        const tr = await getChromeTranslator();
-        if (tr && typeof tr.translate === "function") {
-          const results = await Promise.all(
-            texts.map(async (t) => {
-              try {
-                return { ok: true, translated: await tr.translate(t) };
-              } catch (err) {
-                return {
-                  ok: false,
-                  error: String(err && err.message ? err.message : err),
-                };
-              }
-            })
-          );
-          if (results.some((r) => r.ok)) {
-            resolve(results);
-            return;
-          }
-        }
         chrome.runtime.sendMessage(
           makeMsg(Msg.TRANSLATE_BATCH || "DE_EN_TRANSLATE_BATCH", { texts }),
           (res) => {
@@ -1432,6 +1460,81 @@
     }
   }
 
+  /**
+   * Translate prepared jobs fully in parallel (fills SW pool).
+   * Applies as each pack returns — no waiting for later waves.
+   */
+  async function translateJobsParallel(jobs, gen, quiet, onDone) {
+    let failed = 0;
+    let firstApplied = false;
+    await mapPool(
+      jobs,
+      CONCURRENCY,
+      async (job) => {
+        if (!isGenCurrent(gen)) return;
+        try {
+          if (job.kind === "large") {
+            await translateChunkItems(job.chunk, gen);
+          } else {
+            const translatedFull = await translateViaBackground(job.packed);
+            if (!isGenCurrent(gen)) return;
+            if (job.chunk.length === 1) {
+              applyItemTranslation(job.chunk[0], translatedFull, gen);
+            } else {
+              try {
+                const parts = unpackChunk(translatedFull, job.chunk.length, job.packId);
+                for (let i = 0; i < job.chunk.length; i++) {
+                  applyItemTranslation(job.chunk[i], parts[i], gen);
+                }
+              } catch {
+                await mapPool(
+                  job.chunk,
+                  Math.min(6, CONCURRENCY),
+                  async (item) => {
+                    if (!isGenCurrent(gen)) return;
+                    try {
+                      const solo = await translateViaBackground(sanitizeForPack(item.value));
+                      applyItemTranslation(item, solo, gen);
+                    } catch {
+                      /* leave */
+                    }
+                  },
+                  gen
+                );
+              }
+            }
+          }
+          if (!firstApplied && isGenCurrent(gen)) {
+            firstApplied = true;
+            translated = true;
+            setUiEnglish(true);
+            if (!quiet) showBadge("Translating…", 1800);
+          }
+        } catch {
+          failed++;
+        }
+        if (typeof onDone === "function") onDone();
+      },
+      gen
+    );
+    return failed;
+  }
+
+  function prepareJobs(chunks) {
+    return chunks.map((chunk) => {
+      if (chunk.length === 1 && (chunk[0]._isLargeText || chunk[0]._isLargeAttr)) {
+        return { kind: "large", chunk };
+      }
+      const packed = packChunk(chunk);
+      return {
+        kind: "packed",
+        chunk,
+        packed,
+        packId: chunk._packId,
+      };
+    });
+  }
+
   async function translatePage({ quiet, roots } = {}) {
     if (TOP_FRAME_ONLY && !IS_TOP) return;
     if (phase === "translating" || phase === "restoring") return;
@@ -1441,36 +1544,38 @@
     }
     if (sensitiveSite && !quiet) showBadge("Sensitive site — manual only");
 
-    // R1: generation token invalidates any in-flight applies from prior runs
     const gen = ++runGeneration;
     phase = "translating";
     lastError = false;
     lastErrorDetail = "";
     setUiLoading(true);
     setProgress(0, 1, true);
-    if (!quiet) showBadge("Scanning page…");
+    if (!quiet) showBadge("Translating…");
 
     try {
       pruneDisconnected();
-      // Subtree mode (SPA observer): only scan added roots, not the whole document
       const scanRoots =
         roots && roots.length
-          ? roots.filter((r) => r && (r.isConnected !== false))
+          ? roots.filter((r) => r && r.isConnected !== false)
           : [document.body || document.documentElement];
+      const isSubtree = !!(roots && roots.length);
 
+      // Single scan (text + attrs), then viewport-first parallel translate
       let textNodes = [];
       let attrTargets = [];
       for (const root of scanRoots) {
-        if (!isGenCurrent(gen)) return;
-        if (!root) continue;
-        const part = await collectWorkAsync(root, gen);
-        if (part.textNodes.length) textNodes = textNodes.concat(part.textNodes);
-        if (part.attrTargets.length) attrTargets = attrTargets.concat(part.attrTargets);
+        if (!isGenCurrent(gen) || !root) continue;
+        const part = await collectWorkAsync(root, gen, {
+          textOnly: false,
+          viewportOnly: false,
+          maxItems: MAX_ITEMS_PER_RUN,
+        });
+        textNodes = textNodes.concat(part.textNodes);
+        attrTargets = attrTargets.concat(part.attrTargets);
       }
       if (!isGenCurrent(gen)) return;
-      let items = buildWorkItems(textNodes, attrTargets);
 
-      // P: huge-page item cap
+      let items = buildWorkItems(textNodes, attrTargets);
       let itemsCapped = false;
       if (items.length > MAX_ITEMS_PER_RUN) {
         items = items.slice(0, MAX_ITEMS_PER_RUN);
@@ -1481,129 +1586,67 @@
         if (!isGenCurrent(gen)) return;
         translated = originalTextByNode.size > 0 || originalAttrsByEl.size > 0;
         setUiEnglish(translated);
-        setProgress(0, 0);
-        if (!quiet) showBadge(translated ? "Already translated" : "Nothing to translate");
+        setProgress(0, 0, true);
+        if (!quiet) {
+          showBadge(translated ? "Translated to English" : "Nothing to translate");
+        }
         if (translated) startObserver();
         return;
       }
 
-      if (!quiet) {
-        showBadge(
-          `Found ${items.length} string${items.length === 1 ? "" : "s"}${itemsCapped ? " (capped)" : ""}…`,
-          2500
-        );
-      }
-
-      let chunks = chunkItems(items);
-      let chunksCapped = false;
-      if (chunks.length > MAX_CHUNKS_PER_RUN) {
-        chunks = chunks.slice(0, MAX_CHUNKS_PER_RUN);
-        chunksCapped = true;
-      }
-      const total = chunks.length;
-      let done = 0;
-      let failed = 0;
-      setProgress(0, total);
-
-      // Fast path: pack all chunks, send in large parallel waves via SW batch API
-      // (far fewer message round-trips than one IPC per chunk).
-      const prepared = chunks.map((chunk) => {
-        if (chunk.length === 1 && (chunk[0]._isLargeText || chunk[0]._isLargeAttr)) {
-          return { kind: "large", chunk };
+      // Split: on-screen first so user sees English in ~1 RTT
+      const vpItems = [];
+      const restItems = [];
+      if (!isSubtree) {
+        for (const it of items) {
+          if (itemInViewport(it) && vpItems.length < MAX_VIEWPORT_ITEMS) vpItems.push(it);
+          else restItems.push(it);
         }
-        const packed = packChunk(chunk);
-        return {
-          kind: "packed",
-          chunk,
-          packed,
-          packId: chunk._packId,
-        };
-      });
+      } else {
+        restItems.push(...items);
+      }
 
-      const largeJobs = prepared.filter((p) => p.kind === "large");
-      const packedJobs = prepared.filter((p) => p.kind === "packed");
+      let totalFailed = 0;
+      let totalJobs = 0;
 
-      // Run large-node jobs with pool; packed jobs in SW_BATCH_WAVE parallel batches
-      const largePool = mapPool(
-        largeJobs,
-        Math.min(CONCURRENCY, 4),
-        async (job) => {
-          await translateChunkItems(job.chunk, gen);
+      async function runItemSet(itemSet, label) {
+        if (!itemSet.length || !isGenCurrent(gen)) return;
+        let chunks = chunkItems(itemSet);
+        if (chunks.length > MAX_CHUNKS_PER_RUN) {
+          chunks = chunks.slice(0, MAX_CHUNKS_PER_RUN);
+        }
+        if (label === "vp" && chunks.length > MAX_VIEWPORT_CHUNKS) {
+          chunks = chunks.slice(0, MAX_VIEWPORT_CHUNKS);
+        }
+        const jobs = prepareJobs(chunks);
+        totalJobs += jobs.length;
+        let done = 0;
+        setProgress(0, jobs.length, true);
+        const failed = await translateJobsParallel(jobs, gen, quiet, () => {
           done++;
-          if (isGenCurrent(gen)) bumpProgress(done, total, quiet);
-        },
-        gen
-      );
+          if (isGenCurrent(gen)) bumpProgress(done, jobs.length, quiet || label === "vp");
+        });
+        totalFailed += failed;
+        flushAppliesSync();
+      }
 
-      async function runPackedWaves() {
-        for (let i = 0; i < packedJobs.length; i += SW_BATCH_WAVE) {
-          if (!isGenCurrent(gen)) return;
-          const wave = packedJobs.slice(i, i + SW_BATCH_WAVE);
-          const texts = wave.map((w) => w.packed);
-          let results;
-          try {
-            results = await translateBatchViaBackground(texts);
-          } catch {
-            await mapPool(
-              wave,
-              CONCURRENCY,
-              async (job) => {
-                try {
-                  await translateChunkItems(job.chunk, gen);
-                } catch {
-                  failed++;
-                }
-                done++;
-                if (isGenCurrent(gen)) bumpProgress(done, total, quiet);
-              },
-              gen
-            );
-            continue;
-          }
-          if (!isGenCurrent(gen)) return;
-          for (let j = 0; j < wave.length; j++) {
-            const job = wave[j];
-            const r = results[j];
-            try {
-              if (!r || !r.ok) {
-                await translateChunkItems(job.chunk, gen);
-              } else if (job.chunk.length === 1) {
-                applyItemTranslation(job.chunk[0], r.translated, gen);
-              } else {
-                try {
-                  const parts = unpackChunk(r.translated, job.chunk.length, job.packId);
-                  job.chunk.forEach((item, idx) =>
-                    applyItemTranslation(item, parts[idx], gen)
-                  );
-                } catch {
-                  // Parallel per-item fallback (not sequential)
-                  await mapPool(
-                    job.chunk,
-                    Math.min(CONCURRENCY, 6),
-                    async (item) => {
-                      if (!isGenCurrent(gen)) return;
-                      try {
-                        const solo = await translateViaBackground(sanitizeForPack(item.value));
-                        applyItemTranslation(item, solo, gen);
-                      } catch {
-                        /* leave */
-                      }
-                    },
-                    gen
-                  );
-                }
-              }
-            } catch {
-              failed++;
-            }
-            done++;
-            if (isGenCurrent(gen)) bumpProgress(done, total, quiet);
+      // Pass 1 — viewport (fast perceived start)
+      if (vpItems.length) {
+        await runItemSet(vpItems, "vp");
+        if (isGenCurrent(gen) && (originalTextByNode.size || originalAttrsByEl.size)) {
+          translated = true;
+          setUiEnglish(true);
+          startObserver();
+          if (!quiet && restItems.length) {
+            showBadge("On-screen done — finishing…", 2000);
           }
         }
       }
 
-      await Promise.all([largePool, runPackedWaves()]);
-      flushAppliesSync();
+      // Pass 2 — everything else in parallel
+      if (restItems.length && isGenCurrent(gen)) {
+        await runItemSet(restItems, "rest");
+      }
 
       if (!isGenCurrent(gen)) return;
       pruneDisconnected();
@@ -1611,17 +1654,17 @@
       setUiEnglish(translated);
       if (translated) startObserver();
       lastRetranslateAt = Date.now();
-      if (failed > 0 && failed < total) {
-        lastErrorDetail = `Partial: ${total - failed}/${total} ok`;
+      if (totalFailed > 0 && totalFailed < totalJobs) {
+        lastErrorDetail = `Partial: ${totalJobs - totalFailed}/${totalJobs} ok`;
         if (!quiet) showBadge(lastErrorDetail);
         lastError = false;
-      } else if (failed >= total && total > 0) {
-        lastErrorDetail = "All chunks failed — rate limit or network? Toggle again to retry.";
+      } else if (totalFailed >= totalJobs && totalJobs > 0) {
+        lastErrorDetail = "All chunks failed — rate limit or network? Toggle again.";
         if (!quiet) showBadge(lastErrorDetail, 5000);
         lastError = true;
-      } else if (chunksCapped || itemsCapped) {
-        lastErrorDetail = `Partial: large page — translated first ${total} chunks (toggle again for more)`;
-        if (!quiet) showBadge(lastErrorDetail, 5000);
+      } else if (itemsCapped) {
+        lastErrorDetail = "Large page — first pass done (toggle again for more)";
+        if (!quiet) showBadge(lastErrorDetail, 4000);
         lastError = false;
       } else {
         if (!quiet) showBadge("Translated to English");

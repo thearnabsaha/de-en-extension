@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DE \u2192 EN Page Translator",
-  "version": "1.9.0",
-  "description": "Fast DE\u2192EN page translator: top-frame, throttled network, lighter DOM scan.",
+  "version": "1.9.1",
+  "description": "Fast DE\u2192EN: viewport-first streaming translate, parallel packs.",
   "permissions": [
     "activeTab",
     "scripting",

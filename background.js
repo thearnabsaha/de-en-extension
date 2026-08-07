@@ -20,21 +20,20 @@ const TRANSLATE_ENDPOINT =
 const MAX_ENCODED_Q = 4800;
 /** Reject absurd payloads (F3). */
 const MAX_PLAIN_CHARS = 20000;
-/** Keep batches modest so IPC + Google stay responsive */
-const MAX_BATCH_ITEMS = 48;
-const MAX_RETRIES = 2;
-const BASE_BACKOFF_MS = 280;
+/** Larger batches = fewer content↔SW round-trips */
+const MAX_BATCH_ITEMS = 64;
+const MAX_RETRIES = 1;
+const BASE_BACKOFF_MS = 180;
 
 /**
- * Moderate concurrency + small gap avoids 429 storms that make translation
- * feel "stuck" (retries with backoff dominate wall-clock time).
+ * High throughput: keep the pool busy. Content streams applies as each pack lands.
+ * One retry only — multi-retry was making failed pages feel endless.
  */
-const MAX_CONCURRENT_FETCHES = 8;
-const MIN_GAP_MS = 35;
-/** Fail moderately fast; long hangs block the shared pool */
-const FETCH_TIMEOUT_MS = 9000;
+const MAX_CONCURRENT_FETCHES = 16;
+const MIN_GAP_MS = 0;
+const FETCH_TIMEOUT_MS = 6000;
 
-const CACHE_MAX = 6000;
+const CACHE_MAX = 8000;
 const translateCache = new Map();
 
 let activeFetches = 0;
