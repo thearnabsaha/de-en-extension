@@ -75,28 +75,31 @@
     };
 
   /**
-   * Perf v1.9.2 — minimize HTTP count (few large packs), resilient markers,
-   * never explode into thousands of per-string requests on remap fail.
+   * Perf v1.9.3 — as few Google RTTs as possible, start network ASAP.
+   * Viewport text → 1–2 batch IPC waves → rest of page in background.
    */
-  const MAX_PACK_CHARS = 4000;
+  const MAX_PACK_CHARS = 4200;
   let packSeq = 0;
-  const MAX_ENCODED_HINT = 4700;
-  /** Parallel packs in flight (each pack = 1 Google request) */
-  const CONCURRENCY = 18;
-  /** Pack many short strings per request → far fewer RTTs */
-  const MAX_ITEMS_PER_PACK = 64;
-  const MIN_RETRANSLATE_GAP_MS = 4000;
-  const OBSERVER_DEBOUNCE_MS = 1500;
-  const WALK_YIELD_EVERY = 20000;
-  const MAX_TRACKED_NODES = 6000;
-  const MAX_HASH_SET = 10000;
-  /** Target ~10–25 Google requests per page, not hundreds */
-  const MAX_CHUNKS_PER_RUN = 28;
-  const MAX_ITEMS_PER_RUN = 1400;
+  const MAX_ENCODED_HINT = 4750;
+  const CONCURRENCY = 20;
+  /** Max strings glued into one Google GET */
+  const MAX_ITEMS_PER_PACK = 90;
+  /** Packs per SW batch message (1 IPC → many parallel fetches in SW) */
+  const BATCH_IPC_SIZE = 16;
+  const MIN_RETRANSLATE_GAP_MS = 5000;
+  const OBSERVER_DEBOUNCE_MS = 2000;
+  const WALK_YIELD_EVERY = 50000;
+  const MAX_TRACKED_NODES = 5000;
+  const MAX_HASH_SET = 8000;
+  /** Hard cap on Google requests per pass */
+  const MAX_CHUNKS_PER_RUN = 16;
+  const MAX_ITEMS_PER_RUN = 800;
+  /** First paint: only on-screen text */
+  const MAX_VIEWPORT_ITEMS = 160;
+  const MAX_VIEWPORT_CHUNKS = 8;
   const USE_LOCAL_TRANSLATOR = false;
   const TOP_FRAME_ONLY = true;
-  const PROGRESS_UI_MS = 250;
-  /** Text-only first pass (attrs are secondary and slow the scan) */
+  const PROGRESS_UI_MS = 400;
   const TEXT_ONLY_FIRST_PASS = true;
 
   const DEFAULT_HIDDEN_HOSTS = [
@@ -208,38 +211,17 @@
   function isVisible(el) {
     if (!el || !(el instanceof Element)) return true;
     if (visibilityCache && visibilityCache.has(el)) return visibilityCache.get(el);
-
+    // Attribute-only — no getComputedStyle / checkVisibility (those dominate scan time)
     let ok = true;
-    if (el.hasAttribute("hidden") || el.getAttribute("aria-hidden") === "true") {
+    if (
+      el.hidden ||
+      el.hasAttribute("hidden") ||
+      el.getAttribute("aria-hidden") === "true" ||
+      el.getAttribute("data-no-translate") != null ||
+      el.id === "__de_en_host"
+    ) {
       ok = false;
-    } else if (el.getAttribute("data-no-translate") != null || el.id === "__de_en_host") {
-      ok = false;
-    } else if (typeof el.checkVisibility === "function") {
-      try {
-        ok = el.checkVisibility({
-          checkOpacity: true,
-          checkVisibilityCSS: true,
-          contentVisibilityAuto: true,
-        });
-      } catch {
-        ok = true;
-      }
-    } else {
-      // Cheap fallback: style the element once (not the full ancestor chain)
-      try {
-        const style = window.getComputedStyle(el);
-        if (
-          style.display === "none" ||
-          style.visibility === "hidden" ||
-          parseFloat(style.opacity || "1") === 0
-        ) {
-          ok = false;
-        }
-      } catch {
-        ok = true;
-      }
     }
-
     if (visibilityCache) visibilityCache.set(el, ok);
     return ok;
   }
@@ -303,28 +285,14 @@
     return true;
   }
 
-  /**
-   * Open shadow always. Closed shadow only on custom elements / is= hosts —
-   * probing every HTML node with openOrClosedShadowRoot is very expensive.
-   */
+  /** Open shadow only — closed-shadow probe is too expensive for fast mode */
   function getShadowRoot(el) {
     if (!el) return null;
     try {
-      if (el.shadowRoot) return el.shadowRoot;
+      return el.shadowRoot || null;
     } catch {
-      /* ignore */
+      return null;
     }
-    const tag = el.tagName || "";
-    const isCustom = tag.includes("-") || el.hasAttribute("is");
-    if (!isCustom) return null;
-    try {
-      if (typeof chrome !== "undefined" && chrome.dom && chrome.dom.openOrClosedShadowRoot) {
-        return chrome.dom.openOrClosedShadowRoot(el);
-      }
-    } catch {
-      /* ignore */
-    }
-    return null;
   }
 
   function isButtonLikeInput(el) {
@@ -1472,53 +1440,142 @@
     }
   }
 
+  /** Content-side cache: identical strings skip the network */
+  const localTranslateCache = new Map();
+  const LOCAL_CACHE_MAX = 4000;
+
+  function localCacheGet(text) {
+    if (!localTranslateCache.has(text)) return null;
+    const v = localTranslateCache.get(text);
+    localTranslateCache.delete(text);
+    localTranslateCache.set(text, v);
+    return v;
+  }
+  function localCacheSet(text, out) {
+    if (localTranslateCache.has(text)) localTranslateCache.delete(text);
+    localTranslateCache.set(text, out);
+    while (localTranslateCache.size > LOCAL_CACHE_MAX) {
+      localTranslateCache.delete(localTranslateCache.keys().next().value);
+    }
+  }
+
+  function applyPackedResult(job, translatedFull, gen) {
+    if (!isGenCurrent(gen) || translatedFull == null) return false;
+    if (job.chunk.length === 1) {
+      applyItemTranslation(job.chunk[0], translatedFull, gen);
+      localCacheSet(job.packed, translatedFull);
+      return true;
+    }
+    try {
+      const parts = unpackChunk(translatedFull, job.chunk.length, job.packId);
+      for (let i = 0; i < job.chunk.length; i++) {
+        applyItemTranslation(job.chunk[i], parts[i], gen);
+      }
+      localCacheSet(job.packed, translatedFull);
+      return true;
+    } catch {
+      return false; // leave German — never explode to N requests
+    }
+  }
+
   /**
-   * Translate packs fully in parallel. One pack = one Google request.
-   * On marker fail: leave German for that pack (never N individual storms).
+   * Translate packs via SW batch IPC (one message → many Google GETs in parallel).
+   * Groups of BATCH_IPC_SIZE packs per IPC; groups run concurrently.
    */
   async function translateJobsParallel(jobs, gen, quiet, onDone) {
     let failed = 0;
     let firstApplied = false;
-    await mapPool(
-      jobs,
-      CONCURRENCY,
+    const markFirst = () => {
+      if (firstApplied || !isGenCurrent(gen)) return;
+      firstApplied = true;
+      translated = true;
+      setUiEnglish(true);
+      startObserver();
+      if (!quiet) showBadge("Translating…", 1200);
+    };
+
+    // Resolve cache hits instantly
+    const needNet = [];
+    for (const job of jobs) {
+      if (job.kind === "large") {
+        needNet.push(job);
+        continue;
+      }
+      const hit = localCacheGet(job.packed);
+      if (hit != null) {
+        if (applyPackedResult(job, hit, gen)) markFirst();
+        else failed++;
+        if (onDone) onDone();
+      } else {
+        needNet.push(job);
+      }
+    }
+
+    // Large nodes: small parallel pool
+    const large = needNet.filter((j) => j.kind === "large");
+    const packed = needNet.filter((j) => j.kind !== "large");
+
+    const largeP = mapPool(
+      large,
+      Math.min(4, CONCURRENCY),
       async (job) => {
         if (!isGenCurrent(gen)) return;
         try {
-          if (job.kind === "large") {
-            await translateChunkItems(job.chunk, gen);
-          } else {
-            const translatedFull = await translateViaBackground(job.packed);
-            if (!isGenCurrent(gen)) return;
-            if (job.chunk.length === 1) {
-              applyItemTranslation(job.chunk[0], translatedFull, gen);
-            } else {
-              try {
-                const parts = unpackChunk(translatedFull, job.chunk.length, job.packId);
-                for (let i = 0; i < job.chunk.length; i++) {
-                  applyItemTranslation(job.chunk[i], parts[i], gen);
-                }
-              } catch {
-                // CRITICAL: do NOT fall back to per-string HTTP (turns 1 req into 64).
-                // Leave originals for this pack only.
-                failed++;
-              }
-            }
-          }
-          if (!firstApplied && isGenCurrent(gen)) {
-            firstApplied = true;
-            translated = true;
-            setUiEnglish(true);
-            startObserver();
-            if (!quiet) showBadge("Translating…", 1500);
-          }
+          await translateChunkItems(job.chunk, gen);
+          markFirst();
         } catch {
           failed++;
         }
-        if (typeof onDone === "function") onDone();
+        if (onDone) onDone();
       },
       gen
     );
+
+    // Pack groups → one TRANSLATE_BATCH IPC each (SW fans out fetches)
+    const groups = [];
+    for (let i = 0; i < packed.length; i += BATCH_IPC_SIZE) {
+      groups.push(packed.slice(i, i + BATCH_IPC_SIZE));
+    }
+
+    // Up to 2 batch groups at once (2 × 16 = 32 texts queued; SW caps concurrency)
+    const groupP = mapPool(
+      groups,
+      2,
+      async (group) => {
+        if (!isGenCurrent(gen) || !group.length) return;
+        const texts = group.map((j) => j.packed);
+        let results;
+        try {
+          results = await translateBatchViaBackground(texts);
+        } catch {
+          // Fallback: individual for this small group only
+          results = await Promise.all(
+            texts.map(async (t) => {
+              try {
+                return { ok: true, translated: await translateViaBackground(t) };
+              } catch (err) {
+                return { ok: false, error: String(err) };
+              }
+            })
+          );
+        }
+        if (!isGenCurrent(gen)) return;
+        for (let i = 0; i < group.length; i++) {
+          const job = group[i];
+          const r = results[i];
+          if (r && r.ok && r.translated != null) {
+            if (applyPackedResult(job, r.translated, gen)) markFirst();
+            else failed++;
+          } else {
+            failed++;
+          }
+          if (onDone) onDone();
+        }
+      },
+      gen
+    );
+
+    await Promise.all([largeP, groupP]);
     return failed;
   }
 
@@ -1535,6 +1592,25 @@
         packId: chunk._packId,
       };
     });
+  }
+
+  async function runItemsTranslate(items, gen, quiet, chunkCap) {
+    if (!items.length || !isGenCurrent(gen)) return { failed: 0, total: 0, capped: false };
+    let chunks = chunkItems(items);
+    let capped = false;
+    const cap = chunkCap || MAX_CHUNKS_PER_RUN;
+    if (chunks.length > cap) {
+      chunks = chunks.slice(0, cap);
+      capped = true;
+    }
+    const jobs = prepareJobs(chunks);
+    let done = 0;
+    setProgress(0, jobs.length, true);
+    const failed = await translateJobsParallel(jobs, gen, quiet, () => {
+      done++;
+      if (isGenCurrent(gen)) bumpProgress(done, jobs.length, quiet);
+    });
+    return { failed, total: jobs.length, capped };
   }
 
   async function translatePage({ quiet, roots } = {}) {
@@ -1560,71 +1636,90 @@
         roots && roots.length
           ? roots.filter((r) => r && r.isConnected !== false)
           : [document.body || document.documentElement];
+      const isSubtree = !!(roots && roots.length);
 
-      // Fast scan: text-only on full-page (attrs optional later / quiet subtree keeps attrs)
-      const textOnly = TEXT_ONLY_FIRST_PASS && !(roots && roots.length);
-      let textNodes = [];
-      let attrTargets = [];
-      for (const root of scanRoots) {
-        if (!isGenCurrent(gen) || !root) continue;
-        const part = await collectWorkAsync(root, gen, {
-          textOnly,
-          viewportOnly: false,
-          maxItems: MAX_ITEMS_PER_RUN,
-        });
-        textNodes = textNodes.concat(part.textNodes);
-        if (!textOnly) attrTargets = attrTargets.concat(part.attrTargets);
-      }
-      if (!isGenCurrent(gen)) return;
-
-      let items = buildWorkItems(textNodes, attrTargets);
-      let itemsCapped = false;
-      if (items.length > MAX_ITEMS_PER_RUN) {
-        items = items.slice(0, MAX_ITEMS_PER_RUN);
-        itemsCapped = true;
-      }
-
-      // Viewport-first order so earliest packs in the pool are on-screen
-      {
-        const vp = [];
-        const rest = [];
-        for (const it of items) {
-          if (itemInViewport(it)) vp.push(it);
-          else rest.push(it);
+      // ——— FAST PATH: viewport text only (1 scan + 1 batch wave) ———
+      if (!isSubtree) {
+        let vpText = [];
+        for (const root of scanRoots) {
+          if (!isGenCurrent(gen) || !root) break;
+          const part = await collectWorkAsync(root, gen, {
+            textOnly: true,
+            viewportOnly: true,
+            maxItems: MAX_VIEWPORT_ITEMS,
+          });
+          vpText = vpText.concat(part.textNodes);
         }
-        items = vp.concat(rest);
-      }
+        let vpItems = buildWorkItems(vpText, []);
+        if (vpItems.length > MAX_VIEWPORT_ITEMS) vpItems = vpItems.slice(0, MAX_VIEWPORT_ITEMS);
 
-      if (!items.length) {
-        if (!isGenCurrent(gen)) return;
-        translated = originalTextByNode.size > 0 || originalAttrsByEl.size > 0;
-        setUiEnglish(translated);
-        setProgress(0, 0, true);
-        if (!quiet) {
-          showBadge(translated ? "Translated to English" : "Nothing to translate");
+        if (vpItems.length && isGenCurrent(gen)) {
+          const r = await runItemsTranslate(vpItems, gen, quiet, MAX_VIEWPORT_CHUNKS);
+          if (isGenCurrent(gen) && (originalTextByNode.size || originalAttrsByEl.size)) {
+            translated = true;
+            setUiEnglish(true);
+            startObserver();
+            // Unlock spinner early — page already usable in English
+            setUiLoading(false);
+            setProgress(0, 0, true);
+            if (!quiet) showBadge("Translated — filling rest…", 1400);
+            pushActionState({ error: false });
+          }
+
+          // Rest of page (same gen; toggle bumps gen and aborts)
+          if (isGenCurrent(gen)) {
+            let allText = [];
+            for (const root of scanRoots) {
+              if (!isGenCurrent(gen) || !root) break;
+              const part = await collectWorkAsync(root, gen, {
+                textOnly: true,
+                viewportOnly: false,
+                maxItems: MAX_ITEMS_PER_RUN,
+              });
+              allText = allText.concat(part.textNodes);
+            }
+            if (isGenCurrent(gen)) {
+              let rest = buildWorkItems(allText, []);
+              rest = rest.filter((it) => it.kind !== "text" || !originalTextByNode.has(it.node));
+              if (rest.length > MAX_ITEMS_PER_RUN) rest = rest.slice(0, MAX_ITEMS_PER_RUN);
+              if (rest.length) {
+                await runItemsTranslate(rest, gen, true, MAX_CHUNKS_PER_RUN);
+              }
+            }
+          }
+        } else {
+          // Nothing in viewport — fall through to full
+          let allText = [];
+          for (const root of scanRoots) {
+            if (!isGenCurrent(gen) || !root) break;
+            const part = await collectWorkAsync(root, gen, {
+              textOnly: TEXT_ONLY_FIRST_PASS,
+              viewportOnly: false,
+              maxItems: MAX_ITEMS_PER_RUN,
+            });
+            allText = allText.concat(part.textNodes);
+          }
+          let items = buildWorkItems(allText, []);
+          if (items.length > MAX_ITEMS_PER_RUN) items = items.slice(0, MAX_ITEMS_PER_RUN);
+          if (items.length) await runItemsTranslate(items, gen, quiet, MAX_CHUNKS_PER_RUN);
         }
-        if (translated) startObserver();
-        return;
+      } else {
+        // Subtree quiet retranslate
+        let textNodes = [];
+        let attrTargets = [];
+        for (const root of scanRoots) {
+          if (!isGenCurrent(gen) || !root) continue;
+          const part = await collectWorkAsync(root, gen, {
+            textOnly: false,
+            viewportOnly: false,
+            maxItems: 400,
+          });
+          textNodes = textNodes.concat(part.textNodes);
+          attrTargets = attrTargets.concat(part.attrTargets);
+        }
+        const items = buildWorkItems(textNodes, attrTargets);
+        if (items.length) await runItemsTranslate(items, gen, true, 12);
       }
-
-      // Few large packs — target ~10–28 Google requests total
-      let chunks = chunkItems(items);
-      let chunksCapped = false;
-      if (chunks.length > MAX_CHUNKS_PER_RUN) {
-        chunks = chunks.slice(0, MAX_CHUNKS_PER_RUN);
-        chunksCapped = true;
-      }
-      const jobs = prepareJobs(chunks);
-      const total = jobs.length;
-      let done = 0;
-      setProgress(0, total, true);
-
-      // ALL packs in flight together (viewport-ordered jobs start first)
-      const failed = await translateJobsParallel(jobs, gen, quiet, () => {
-        done++;
-        if (isGenCurrent(gen)) bumpProgress(done, total, quiet);
-      });
-      flushAppliesSync();
 
       if (!isGenCurrent(gen)) return;
       pruneDisconnected();
@@ -1632,24 +1727,10 @@
       setUiEnglish(translated);
       if (translated) startObserver();
       lastRetranslateAt = Date.now();
-
-      if (failed > 0 && failed < total) {
-        lastErrorDetail = `Done (${total - failed}/${total} packs)`;
-        if (!quiet) showBadge("Translated to English");
-        lastError = false;
-      } else if (failed >= total && total > 0) {
-        lastErrorDetail = "Translation failed — try again";
-        if (!quiet) showBadge(lastErrorDetail, 4000);
-        lastError = true;
-      } else if (chunksCapped || itemsCapped) {
-        if (!quiet) showBadge("Translated (partial — toggle again for more)");
-        lastError = false;
-      } else {
-        if (!quiet) showBadge("Translated to English");
-        lastError = false;
-        lastErrorDetail = "";
-      }
-      pushActionState({ error: lastError });
+      if (!quiet) showBadge(translated ? "Translated to English" : "Nothing to translate");
+      lastError = false;
+      lastErrorDetail = "";
+      pushActionState({ error: false });
     } catch (e) {
       if (!isGenCurrent(gen)) return;
       console.error("[DE-EN Translator]", e);

@@ -20,16 +20,16 @@ const TRANSLATE_ENDPOINT =
 const MAX_ENCODED_Q = 4800;
 /** Reject absurd payloads (F3). */
 const MAX_PLAIN_CHARS = 20000;
-const MAX_BATCH_ITEMS = 80;
-const MAX_RETRIES = 1;
-const BASE_BACKOFF_MS = 120;
+const MAX_BATCH_ITEMS = 100;
+const MAX_RETRIES = 0; // fail fast — retries double wall time
+const BASE_BACKOFF_MS = 80;
 
-/** Max parallel Google GETs — content uses fewer, larger packs. */
-const MAX_CONCURRENT_FETCHES = 20;
+/** Max parallel Google GETs */
+const MAX_CONCURRENT_FETCHES = 24;
 const MIN_GAP_MS = 0;
-const FETCH_TIMEOUT_MS = 5000;
+const FETCH_TIMEOUT_MS = 4000;
 
-const CACHE_MAX = 10000;
+const CACHE_MAX = 12000;
 const translateCache = new Map();
 
 let activeFetches = 0;

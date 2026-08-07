@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DE \u2192 EN Page Translator",
-  "version": "1.9.2",
-  "description": "Fast DE\u2192EN: few large packs, resilient markers, no retry storms.",
+  "version": "1.9.3",
+  "description": "Fast DE\u2192EN: viewport-first, batched IPC, minimal DOM work.",
   "permissions": [
     "activeTab",
     "scripting",
